@@ -34,6 +34,10 @@ _Avoid_: Prompt, ticket
 One provider session executing one task packet under a resolved role and execution policy.
 _Avoid_: Agent, workflow
 
+**Workflow Run**:
+One orchestrator-owned execution of a workflow template that coordinates child Agent Runs and produces one terminal workflow outcome.
+_Avoid_: Agent Run, provider session
+
 **Workflow Node**:
 A dependency-aware unit of workflow execution that produces an artifact for downstream nodes.
 _Avoid_: Child agent, task packet
