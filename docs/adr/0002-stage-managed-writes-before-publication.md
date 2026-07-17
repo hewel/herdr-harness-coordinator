@@ -1,0 +1,3 @@
+# Stage managed writes before publication
+
+Managed providers write to a private overlay over an immutable repository snapshot, and the orchestrator publishes a sealed, validated candidate only after required review and verification succeed. Direct worktree writes would expose user changes to untrusted startup code and make failed review inseparable from mutation, while manual patch application would break the intended bounded-edit workflow; journaled compare-and-swap publication keeps the host untouched during execution and makes Linux's lack of an unprivileged multi-path transaction explicit through quarantine rather than automatic rollback.

@@ -19,10 +19,12 @@
 
 ## Repository safety
 
+- Treat `docs/research/mvp/repository-safety-contract.md` as the normative Managed-runtime safety boundary.
 - Inspect and preserve the user's existing repository state before every editing run.
-- Capture a Git baseline, validate declared write scopes, and acquire a repository-specific editing lock before execution.
-- Permit only one editing agent per worktree. Read-only verification may run concurrently when it cannot interfere with edits.
-- Compare final state to the baseline and invalidate out-of-scope changes. Never automatically revert, merge, or discard unexpected modifications.
+- Capture a Repository Snapshot, validate declared scopes, and acquire a Worktree Lease before execution.
+- Run providers against a private Run Overlay; only a sealed, validated Publish Delta may reach the live worktree.
+- Permit only one editing workflow per worktree. Read-only verification may run concurrently when it cannot interfere with edits.
+- Quarantine uncertain publication and never automatically revert, merge, or discard unexpected modifications.
 - Reject unresolved architecture choices in child tasks; return them to the parent agent for a decision.
 
 ## MVP boundaries

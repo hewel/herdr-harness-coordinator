@@ -147,7 +147,7 @@ The runtime must additionally:
 
 - Remove editing tools where possible
 - Use an empty write scope
-- Capture a Git baseline
+- Capture a [Repository Snapshot](research/mvp/repository-safety-contract.md)
 - Detect unexpected changes
 - Reject the run if repository boundaries are violated
 
@@ -933,24 +933,28 @@ OpenCode → task_id continuation
 
 ## Repository Safety
 
+The [Managed repository safety contract](research/mvp/repository-safety-contract.md)
+is authoritative for the MVP's Linux containment, snapshot, scope, publication,
+and recovery guarantees.
+
 ### Before Execution
 
 - Validate the task is bounded
-- Inspect `git status`
-- Record HEAD
-- Record index state
-- Record modified and untracked files
+- Resolve repository and linked-worktree identity
+- Acquire a kernel-owned Worktree Lease
+- Capture a full immutable Repository Snapshot, including dirty, untracked, and ignored state
 - Preserve existing user changes
-- Validate write-scope entries
-- Acquire a repository-specific edit lock
+- Validate exact-file, subtree, scratch, ignored, dirty, and destructive-change policy
+- Prove the fail-closed Linux containment backend and model broker
 - Resolve the effective role policy
 - Resolve workspace isolation
 
 ### During Execution
 
+- Project the snapshot through a private Run Overlay instead of mounting the live worktree
 - Enforce role tool restrictions
-- Enforce command policies where available
-- Track repository changes
+- Enforce filesystem, process-tree, command, credential, and network policy independently of the provider
+- Track and seal the candidate Publish Delta
 - Record provider events
 - Prevent overlapping editing runs
 - Reject unresolved architecture decisions
@@ -958,11 +962,12 @@ OpenCode → task_id continuation
 
 ### After Execution
 
-- Compare final state with the baseline
-- Detect changes outside the write scope
+- Validate the Publish Delta against the Repository Snapshot and effective policy
+- Compare the complete live worktree and Git state with the baseline before publication
 - Confirm verification commands match the task specification
-- Preserve unexpected changes for inspection
-- Never automatically revert
+- Publish through a durable journal and per-path compare-and-swap operations
+- Preserve invalid overlays and quarantine uncertain or partial publication
+- Never automatically revert published or unexpected changes
 - Mark invalid runs explicitly
 - Return diff and evidence to the parent agent
 
@@ -985,11 +990,15 @@ Use when:
 
 - The task depends on uncommitted user changes
 - The task is small and mechanical
-- Direct integration is required
+- The validated candidate should publish back to the selected worktree
+
+`CurrentWorktree` identifies the baseline and publication target. The provider
+still executes against a private Run Overlay and never receives the live
+worktree as a writable mount.
 
 Rule:
 
-> Only one editing `AgentRun` may operate in a worktree.
+> Only one editing workflow may hold the Worktree Lease for a worktree.
 
 Read-only reviewers and verifiers may run concurrently when safe.
 

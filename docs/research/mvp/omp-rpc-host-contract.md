@@ -81,9 +81,10 @@ and the
 
 Consequently, validating `dumpTools` after `ready` detects an unexpected tool
 set but cannot contain side effects already performed during discovery. The
-Managed OMP path is blocked until the repository-safety contract supplies
-process isolation before OMP starts, or a verified OMP version supplies a
-complete discovery-disable mechanism.
+Managed OMP path is blocked until the
+[Managed repository safety contract](repository-safety-contract.md) is
+implemented and proves process isolation before OMP starts, or a verified OMP
+version supplies a complete discovery-disable mechanism.
 
 ## Managed Runtime MVP decisions
 
@@ -98,7 +99,7 @@ One worker starts one run-owned OMP process with the equivalent of:
 ```text
 omp
   --mode rpc
-  --cwd <validated-worktree>
+  --cwd <validated-worktree-path-projected-from-run-overlay>
   --session-dir <run-state-dir>/provider-session
   --append-system-prompt <run-state-dir>/resolved-role-prompt.md
   --tools <comma-separated-effective-builtins>
@@ -110,8 +111,11 @@ omp
   --approval-mode <effective-policy-mode>
 ```
 
-The worker passes the task through the RPC `prompt` command, not as a CLI
-argument. It does not use `--no-session`, `--continue`, `--resume`, or an
+The `--cwd` value is the validated absolute worktree path inside the sandbox;
+it resolves to the Repository Snapshot and Run Overlay projection, never the
+live writable worktree. The worker passes the task through the RPC `prompt`
+command rather than as a CLI argument. It does not use `--no-session`,
+`--continue`, `--resume`, or an
 initial message. The system-prompt append file contains only the resolved role,
 policy summary, artifact protocol, and bounded task behavior; secrets are not
 placed in argv or the prompt file.
@@ -148,11 +152,12 @@ mode because provider-level approval is not the repository security boundary.
 ### Environment boundary
 
 The worker removes every `HERDR_*` variable from the OMP child's environment.
-It passes only the provider credentials and runtime variables explicitly
-allowed by effective policy; it does not inherit arbitrary tool, plugin,
-collaboration, or provider-routing overrides. OMP native session identity is
-stored in orchestrator state and is never reported to Herdr as a native restore
-reference.
+It passes only the run-scoped model-broker endpoint and capability plus runtime
+variables explicitly allowed by effective policy. The real provider credential
+stays in the host-side broker. The child does not inherit arbitrary tool,
+plugin, collaboration, credential, or provider-routing overrides. OMP native
+session identity is stored in orchestrator state and is never reported to
+Herdr as a native restore reference.
 
 This preserves the worker as the sole semantic status authority under the
 [Herdr pane and plugin control contract](herdr-pane-plugin-control-contract.md).
@@ -228,9 +233,9 @@ verification evidence, deviations, and risks. The host:
    request ID.
 
 A successful host-tool result does not complete the run. Success still
-requires `agent_end`, artifact validation, repository post-checks, and the
-orchestrator-owned verification commands. Natural-language assistant output is
-never parsed as the authoritative artifact.
+requires `agent_end`, artifact validation, Run Overlay and Publish Delta
+validation, and the orchestrator-owned verification and publication boundaries.
+Natural-language assistant output is never parsed as the authoritative artifact.
 
 ### UI requests
 
@@ -305,15 +310,17 @@ The provider run fails without automatic retry when any of these occurs:
 
 OMP command errors are normally recoverable at the process level, but an error
 for a command required by this contract fails the AgentRun. The runtime keeps
-stderr as diagnostic output and never parses it as RPC. It preserves all
-repository changes and evidence for inspection and never automatically reverts
-or retries the run.
+stderr as diagnostic output and never parses it as RPC. It preserves the Run
+Overlay and, when applicable, Publish Journal and Repository Quarantine
+evidence for inspection. It never automatically reverts or retries the run.
 
 ## Required startup safety dependency
 
 The Managed OMP vertical slice must not be enabled merely because its adapter
-implements this handshake. Before OMP is spawned, the repository-safety layer
-must provide an OS-enforced process boundary that:
+implements this handshake. Before OMP is spawned, the
+[Managed repository safety contract](repository-safety-contract.md) must pass
+its fail-closed Linux capability probes and provide an OS-enforced process
+boundary that:
 
 - limits filesystem writes to the effective write scope and run-owned state;
 - prevents user/project tool factories and MCP servers from escaping that
@@ -321,17 +328,19 @@ must provide an OS-enforced process boundary that:
 - applies to OMP and every subprocess it creates; and
 - remains in force until the provider process is reaped.
 
-The exact sandbox mechanism belongs to the repository-safety decision. Until
-that decision is implemented, OMP Managed runs must return a clear unsupported
-or safety-prerequisite error. A future OMP version with a verified, complete
-disable-discovery capability may remove this blocker only after its startup
-path is re-audited.
+That boundary uses the contract's private Repository Snapshot and Run Overlay,
+Bubblewrap namespaces, Landlock, seccomp, cgroup v2 containment, nested command
+sandbox, and broker-only model network. Until it is implemented and proved,
+OMP Managed runs must return a clear unsupported or safety-prerequisite error.
+A future OMP version with a verified, complete disable-discovery capability may
+remove only the corresponding masking requirement after its startup path is
+re-audited; it does not remove the repository boundary.
 
 ## Downstream implementation obligations
 
-- **Repository safety contract:** select and prove the startup-time process
-  sandbox, including pre-`ready` imports, MCP subprocesses, and descendant
-  processes.
+- **Repository safety contract:** implement and prove the linked startup-time
+  filesystem, network, credential, and descendant-process boundary, including
+  pre-`ready` imports and MCP subprocesses.
 - **Provider adapter:** model every accepted RPC frame as version-pinned Rust
   protocol types, maintain command and host-call correlation maps, and keep
   native types inside the OMP module.

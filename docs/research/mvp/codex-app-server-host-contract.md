@@ -151,18 +151,20 @@ would import user hooks, plugins, MCP servers, sessions, rules, memories, and
 other unresolved state. A run-owned home also prevents `skills/config/write`
 from changing another concurrently running role's enabled-skill set.
 
-The default noninteractive authentication path injects `CODEX_ACCESS_TOKEN`
-only into the App Server process. A deployment may instead provision supported
-file or keyring credentials directly into the run-owned home through its secret
-manager, but the orchestrator never copies credentials from the user's Codex
-home. The managed directory is created with owner-only permissions. Credentials
-never appear in argv, task packets, transcripts, or persisted role prompts.
-Missing or invalid managed authentication is an authentication failure, not
-permission to fall back to the user's Codex home. See the official
+The host-side model broker owns and injects the real provider credential. App
+Server receives only the broker endpoint and a run-scoped capability; no
+reusable provider credential is written into its environment, managed home,
+argv, task packet, transcript, or persisted role prompt. The orchestrator never
+copies credentials from the user's Codex home. The managed directory is
+created with owner-only permissions. A profile that cannot use the broker is
+unsupported, and missing or invalid broker authorization is not permission to
+fall back to the user's Codex home. See the official
 [authentication guidance](https://developers.openai.com/codex/auth).
 
-The process starts inside the outer repository sandbox and run-owned process
-group with the equivalent of:
+The process starts inside the outer Repository Guard sandbox and run-owned
+process boundary. Its validated absolute worktree path projects the private
+Repository Snapshot and Run Overlay, never the live writable worktree. It uses
+the equivalent of:
 
 ```text
 codex app-server
@@ -206,10 +208,11 @@ automated review can introduce provider-owned agent behavior.
 
 The managed configuration sets `shell_environment_policy.inherit = "none"`,
 keeps Codex's default secret-name exclusions enabled, and supplies only the
-minimal command environment resolved by policy. Provider credentials are
-available to App Server itself but are never forwarded to model-generated
-commands. The outer process sandbox must additionally prevent descendants from
-recovering the provider environment through host process-inspection APIs.
+minimal command environment resolved by policy. App Server receives the model
+broker endpoint and run-scoped capability, but neither that capability nor an
+underlying provider credential is forwarded to model-generated commands. The
+outer process sandbox must additionally prevent descendants from recovering
+the provider environment through host process-inspection APIs.
 
 ### Environment boundary
 
@@ -218,11 +221,12 @@ This is required because the official Herdr Codex integration uses a global
 `SessionStart` hook and the Herdr environment/socket/pane identity to publish
 native lifecycle state. Hooks are disabled as a second independent measure.
 
-Only run-owned home paths, explicitly allowed credentials, locale/runtime
-essentials, and effective policy variables are passed. Arbitrary MCP, plugin,
-hook, browser, collaboration, provider-routing, and model overrides are not
-inherited. The implementation must prove in a real Herdr pane that this
-sanitized child emits no official Herdr lifecycle or native restore reference.
+Only run-owned home paths, the run-scoped broker endpoint and capability,
+locale/runtime essentials, and effective policy variables are passed.
+Arbitrary credentials, MCP, plugin, hook, browser, collaboration,
+provider-routing, and model overrides are not inherited. The implementation
+must prove in a real Herdr pane that this sanitized child emits no official
+Herdr lifecycle or native restore reference.
 
 ### Startup handshake
 
@@ -254,11 +258,11 @@ compatibility evidence requiring review rather than proof of stronger safety.
 ### Pre-thread skill audit
 
 Before `thread/start`, the adapter sends `skills/list` with
-`forceReload: true` and exactly the validated worktree path in `cwds`. It
-canonicalizes each discovered skill path, retains discovery errors and warnings,
-and compares each skill with the exact allowed-skill set produced by role and
-policy resolution. The three built-in MVP roles resolve to an empty allowed set
-by default.
+`forceReload: true` and exactly the validated sandbox-projected worktree path in
+`cwds`. It canonicalizes each discovered skill path inside that projection,
+retains discovery errors and warnings, and compares each skill with the exact
+allowed-skill set produced by role and policy resolution. The three built-in
+MVP roles resolve to an empty allowed set by default.
 
 For every discovered skill not explicitly allowed, the adapter calls
 `skills/config/write` with its absolute path and `enabled: false`. If an allowed
@@ -283,7 +287,8 @@ the startup/process sandbox and effective runtime policy.
 
 The adapter sends one `thread/start` request with:
 
-- the validated absolute worktree path as `cwd`;
+- the validated absolute worktree path as `cwd`, projected from the Repository
+  Snapshot and Run Overlay rather than the live worktree;
 - an explicit model and provider only when already resolved by the selected
   provider profile;
 - `sandbox: "read-only"` regardless of the eventual editing role;
@@ -308,12 +313,12 @@ unrequested effective setting fails startup.
 
 `ThreadStartResponse.instructionSources` is a separate instruction channel from
 skills. Before provider launch, the repository guard resolves the expected
-canonical AGENTS instruction files for the validated working directory. The
-adapter preserves the returned `instructionSources` independently of the skill
-audit and requires its canonical local paths to match that expected set exactly.
-An unexpected, missing, remote, or noncanonical instruction source fails
-startup. The contents and precedence of approved AGENTS files remain governed
-by the parent task and repository instructions; they are never disabled through
+canonical AGENTS instruction files in the sandbox projection. The adapter
+preserves the returned `instructionSources` independently of the skill audit and
+requires its canonical projected paths to match that expected set exactly. An
+unexpected, missing, remote, or noncanonical instruction source fails startup.
+The contents and precedence of approved AGENTS files remain governed by the
+parent task and repository instructions; they are never disabled through
 `skills/config/write`.
 
 ### Bounded turn and role sandbox
@@ -334,8 +339,9 @@ contains:
 
 Codex workspace-write semantics may permit writes to the working directory in
 addition to listed roots. The App Server sandbox therefore cannot express the
-orchestrator's exact path-level write scope. The outer repository guard remains
-authoritative and checks all final changes against the baseline.
+orchestrator's exact path-level write scope. The outer Repository Guard remains
+authoritative: all writes stay in the Run Overlay and only a validated Publish
+Delta can reach the live worktree.
 
 The adapter persists the turn ID from the response before treating any later
 event as turn evidence. Because notifications may arrive before the correlated
@@ -489,14 +495,16 @@ The provider run fails without orchestrator retry when any of these occurs:
 App Server overload and model errors may be retryable at the protocol/provider
 level, but the Managed MVP does not create a second App Server, thread, or turn
 automatically. It preserves all logs, transcript fragments, provider state,
-repository changes, and correlation evidence for parent inspection. It never
-automatically reverts provider changes.
+Run Overlay state, publication or quarantine evidence, and correlation evidence
+for parent inspection. It never automatically reverts provider changes.
 
 ## Required repository-safety dependency
 
 The Managed Codex vertical slice must not be enabled merely because the adapter
-implements this handshake. Before App Server starts, the repository-safety
-layer must provide an OS-enforced process boundary that:
+implements this handshake. Before App Server starts, the
+[Managed repository safety contract](repository-safety-contract.md) must pass
+its fail-closed Linux capability probes and provide an OS-enforced process
+boundary that:
 
 - contains App Server and every command, skill-invoked script, terminal, and
   descendant process it creates;
@@ -512,13 +520,14 @@ layer must provide an OS-enforced process boundary that:
 Codex sandboxing and managed-home configuration are defense-in-depth, not the
 repository security boundary. In particular, no complete stable provider tool
 allowlist exists in `0.144.5`, and repository skills remain discoverable. Until
-the repository-safety decision is implemented and proved, Managed Codex runs
-must return a clear unsupported or safety-prerequisite error.
+the linked contract is implemented and proved, Managed Codex runs must return a
+clear unsupported or safety-prerequisite error.
 
 ## Downstream implementation obligations
 
-- **Repository safety contract:** select and prove the startup-time filesystem,
-  network, and descendant-process sandbox plus process-group cancellation.
+- **Repository safety contract:** implement and prove the linked startup-time
+  filesystem, network, credential, descendant-process, and publication
+  boundary.
 - **Provider adapter:** generate and pin the `0.144.5` schemas, model the stable
   handshake and accepted frames as Rust types, maintain request/server-request
   correlation, and keep native types inside the Codex module.

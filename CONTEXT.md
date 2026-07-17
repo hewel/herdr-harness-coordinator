@@ -69,5 +69,33 @@ A structured artifact that transfers bounded context and instructions between ag
 _Avoid_: Shared chat history
 
 **Repository Guard**:
-The authority that validates repository baselines, write scopes, edit exclusivity, and final changes for an agent run.
+The authority that owns repository snapshots, run overlays, write scopes, worktree leases, and validated publication for an agent run.
 _Avoid_: Git wrapper, prompt rule
+
+**Repository Snapshot**:
+An immutable, run-owned record of the complete worktree and Git baseline from which managed execution begins.
+_Avoid_: Git baseline, checkout copy
+
+**Run Overlay**:
+The private writable repository view in which a managed provider produces a candidate without changing the live worktree.
+_Avoid_: Sandbox worktree, temporary checkout
+
+**Publish Delta**:
+The validated difference between a repository snapshot and a sealed run overlay that is eligible for publication.
+_Avoid_: Agent diff, working changes
+
+**Scratch Scope**:
+A declared writable path whose contents are evidence or temporary runtime output and can never enter a publish delta.
+_Avoid_: Ignored scope, temporary write scope
+
+**Worktree Lease**:
+Exclusive editing ownership of one resolved worktree for the duration of a managed run or workflow.
+_Avoid_: Repository lock, agent lock
+
+**Publish Journal**:
+The durable record of intended and completed host mutations used to identify publication progress and uncertainty.
+_Avoid_: Change log, rollback log
+
+**Repository Quarantine**:
+A state that blocks new editing runs because publication may be partial or repository state cannot be proven safe.
+_Avoid_: Failed lock, dirty repository

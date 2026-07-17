@@ -130,9 +130,9 @@ as title, provider, role, current phase, and terminal outcome.
 
 | Orchestrator state | Herdr semantic state |
 | --- | --- |
-| Preparing, starting, working, editing, verifying, collecting artifacts, repository checking | `working` |
+| Preparing, starting, working, editing, verifying, collecting artifacts, repository checking, publishing, reconciling | `working` |
 | Waiting for input or approval | `blocked` |
-| Completed, invalid, failed, or cancelled | `idle` |
+| Completed, invalid (including repository quarantine), failed, or cancelled | `idle` |
 | Live state cannot be reconciled | `unknown` |
 
 SQLite and artifact files remain authoritative. Herdr metadata is a projection,
@@ -145,16 +145,20 @@ as a new Herdr lifecycle state.
 - Focus resolves the persisted `terminal_id` against the current snapshot,
   updates stale location IDs, and calls `plugin.pane.focus` for the current
   plugin-owned worker pane.
-- Cancellation first persists cancellation intent, then asks the provider
-  adapter to cancel cooperatively through its native protocol.
+- While the repository-safety cancellation gate is open, cancellation first
+  persists cancellation intent, then asks the provider adapter to cancel
+  cooperatively through its native protocol. Once publication reaches its point
+  of no return, the command returns `too late` and does not interrupt the
+  publisher.
 - If the provider does not stop within the lifecycle-policy grace period, the
   runtime escalates with `plugin.pane.close`. Forced termination is recorded
   separately from cooperative cancellation.
 - Closing the details popup calls only `popup.close`; it never cancels the run
   or closes the worker pane.
 
-The grace duration and cancellation race precedence belong to the lifecycle
-contract. This note fixes only the cooperative-then-forced ordering.
+The grace duration and non-publication cancellation race precedence belong to
+the lifecycle contract. This note fixes the cooperative-then-forced ordering
+and the publication gate only.
 
 ### Popup contract
 
@@ -179,7 +183,12 @@ On a socket reconnect or control-client restart, the runtime:
 If the terminal still exists, the run continues without a lifecycle transition.
 If an active worker pane exits or closes, the runtime completes an already
 requested cancellation or otherwise fails the run with a host-pane-loss reason.
-In both cases it performs repository post-checks before releasing an edit lease.
+In both cases it reconciles the phase under the
+[Managed repository safety contract](repository-safety-contract.md): a
+pre-publication loss preserves the Run Overlay and may release the Worktree
+Lease only after proving the host still matches the baseline, while an uncertain
+or partial publication enters Repository Quarantine and continues to block
+editing.
 
 After a cold Herdr server restart, the original worker and provider processes
 are gone. The MVP therefore:
@@ -187,8 +196,8 @@ are gone. The MVP therefore:
 1. observes that the persisted terminal binding is absent;
 2. fails the active run with a cold-host-restart reason;
 3. clears the live Herdr binding;
-4. performs repository reconciliation and preserves all changes for parent
-   inspection; and
+4. preserves an unpublished overlay or reconciles the Publish Journal and
+   quarantines uncertain publication for parent inspection; and
 5. requires the parent to submit a new run.
 
 It never automatically adopts, resumes, or retries the old provider session.
@@ -203,8 +212,8 @@ It never automatically adopts, resumes, or retries the old provider session.
 - **Lifecycle and recovery contract:** define the cooperative-cancel grace
   duration, event ordering, repeated cancellation behavior, and terminal-state
   precedence for cancel/exit/verification races.
-- **Repository safety contract:** define the post-check performed after worker
-  loss or cold restart and the point at which the edit lease may be released.
+- **Repository safety contract:** implement the linked phase-aware reconciliation
+  boundary, including safe Worktree Lease release and Repository Quarantine.
 - **Popup prototype:** validate focus, cancel, and close behavior through a real
   Herdr popup without transferring process ownership to the popup.
 - **Herdr transport implementation:** generate or pin request/event types from
@@ -223,5 +232,6 @@ It never automatically adopts, resumes, or retries the old provider session.
 - Closing the popup leaves the worker and provider running.
 - Presentation metadata never changes semantic waits or durable workflow state.
 - Socket reconnect reconstructs live mappings from a fresh snapshot and events.
-- Worker loss and cold restart fail the run, reconcile repository state, and do
-  not automatically retry, resume, or adopt a provider session.
+- Worker loss and cold restart fail the run, preserve an unpublished Run
+  Overlay or quarantine uncertain publication, and do not automatically retry,
+  resume, adopt, or roll back a provider session.
