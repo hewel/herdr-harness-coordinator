@@ -142,7 +142,7 @@ pub struct PluginPaneOpenParams {
 
 impl PluginPaneOpenParams {
     #[must_use]
-    pub fn supervisor(session_capability: &str, cwd: &Path, workspace_id: Option<String>) -> Self {
+    pub fn supervisor(session_capability: &str, _cwd: &Path, workspace_id: Option<String>) -> Self {
         let mut env = BTreeMap::new();
         env.insert(
             "HERDR_SUPERVISOR_CAPABILITY".to_owned(),
@@ -153,7 +153,7 @@ impl PluginPaneOpenParams {
             entrypoint: SUPERVISOR_ENTRYPOINT.to_owned(),
             placement: Some("tab".to_owned()),
             workspace_id,
-            cwd: Some(cwd.to_string_lossy().into_owned()),
+            cwd: None,
             env,
             focus: true,
         }

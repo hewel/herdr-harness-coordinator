@@ -2239,7 +2239,12 @@ impl Coordinator {
                     .await
                     .map_err(CoordinatorError::storage)?;
             }
-            let category = if submission.session_reuse == SessionReusePolicy::Required {
+            // A never-used Session that cannot satisfy its own immutable launch
+            // selection will not become compatible by rotating the same profile.
+            // Surface the blocker instead of creating an unbounded launch loop.
+            let category = if submission.session_reuse == SessionReusePolicy::Required
+                || prior_bindings == 0
+            {
                 ErrorCategory::InvalidState
             } else {
                 ErrorCategory::TargetOffline

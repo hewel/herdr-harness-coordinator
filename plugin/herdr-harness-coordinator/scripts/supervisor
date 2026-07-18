@@ -2,8 +2,8 @@
 set -eu
 
 : "${HERDR_SOCKET_PATH:?Herdr did not provide HERDR_SOCKET_PATH}"
-: "${HERDR_PLUGIN_STATE_DIR:?Coordinator did not provide HERDR_PLUGIN_STATE_DIR}"
+: "${HERDR_COORDINATOR_STATE_DIR:?Coordinator did not provide HERDR_COORDINATOR_STATE_DIR}"
 : "${HERDR_SUPERVISOR_CAPABILITY:?Coordinator did not provide HERDR_SUPERVISOR_CAPABILITY}"
 
 coordinator_bin="${HERDR_COORDINATOR_BIN:-herdr-harness-coordinator}"
-exec "$coordinator_bin" supervisor-host
+exec "$coordinator_bin" supervisor-host --state-dir "$HERDR_COORDINATOR_STATE_DIR"

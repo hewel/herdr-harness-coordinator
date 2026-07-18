@@ -9,8 +9,8 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::contract::{
-    AttachmentId, HarnessKind, HarnessSessionId, HarnessTier, NativeSessionHealth, SupervisorEvent,
-    TaskId,
+    AttachmentId, CodexApprovalPolicy, CodexSandboxMode, HarnessKind, HarnessSessionId,
+    HarnessTier, NativeSessionHealth, SupervisorEvent, TaskId,
 };
 
 const MAX_VERSION_OUTPUT_BYTES: usize = 4096;
@@ -120,6 +120,10 @@ pub struct HarnessStartSpec {
     pub model: Option<String>,
     /// OMP configuration overlays; empty for Codex.
     pub config_overlays: Vec<PathBuf>,
+    /// Explicit Codex App Server approval policy, when selected by a v3 profile.
+    pub codex_approval_policy: Option<CodexApprovalPolicy>,
+    /// Explicit Codex App Server sandbox mode, when selected by a v3 profile.
+    pub codex_sandbox_mode: Option<CodexSandboxMode>,
     /// Already-filtered environment values inherited by the provider.
     pub environment: BTreeMap<String, String>,
 }

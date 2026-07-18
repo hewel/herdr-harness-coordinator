@@ -236,6 +236,53 @@ pub struct HarnessLaunchProfileV2 {
     pub config_overlays: Vec<PathBuf>,
 }
 
+/// Coordinator-owned launch selection with explicit Codex App Server policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessLaunchProfileV3 {
+    /// Must equal three.
+    pub schema_version: u32,
+    /// Immutable profile identifier.
+    pub id: HarnessId,
+    /// Native Harness Kind; v3 is currently Codex-specific.
+    pub kind: HarnessKind,
+    /// Absolute executable or one bare command resolved through `PATH`.
+    pub executable: String,
+    /// Explicit model selected by the user.
+    pub model: String,
+    /// Codex App Server approval policy sent at `thread/start`.
+    pub approval_policy: CodexApprovalPolicy,
+    /// Codex App Server sandbox mode sent at `thread/start`.
+    pub sandbox_mode: CodexSandboxMode,
+    /// Environment variable names explicitly inherited by the Worker.
+    #[serde(default)]
+    pub inherit_env: Vec<String>,
+}
+
+/// Stable subset of Codex App Server approval policies accepted by v3 profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexApprovalPolicy {
+    /// Ask for commands outside the trusted allowlist.
+    Untrusted,
+    /// Let the model request escalation.
+    OnRequest,
+    /// Never pause for interactive approval.
+    Never,
+}
+
+/// Stable subset of Codex App Server sandbox modes accepted by v3 profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexSandboxMode {
+    /// Permit filesystem reads only.
+    ReadOnly,
+    /// Permit writes inside the configured workspace roots.
+    WorkspaceWrite,
+    /// Delegate isolation to the same-user cooperative Coordinator boundary.
+    DangerFullAccess,
+}
+
 impl Validate for HarnessLaunchProfileV1 {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_version(self.schema_version)?;
@@ -301,6 +348,46 @@ impl Validate for HarnessLaunchProfileV2 {
         }
         Ok(())
     }
+}
+
+impl Validate for HarnessLaunchProfileV3 {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.schema_version != 3 {
+            return field_error("schema_version", "must equal 3");
+        }
+        if self.kind != HarnessKind::Codex {
+            return field_error("kind", "v3 profiles currently support only codex");
+        }
+        validate_v2_executable_and_environment(&self.executable, &self.model, &self.inherit_env)
+    }
+}
+
+fn validate_v2_executable_and_environment(
+    executable: &str,
+    model: &str,
+    inherit_env: &[String],
+) -> Result<(), ValidationError> {
+    let path = Path::new(executable);
+    let bare = !executable.is_empty()
+        && path.components().count() == 1
+        && executable != "."
+        && executable != "..";
+    if !path.is_absolute() && !bare {
+        return field_error("executable", "must be absolute or a bare command name");
+    }
+    validate_text("model", model, 256, 1024)?;
+    validate_unique_limit("inherit_env", inherit_env, 128)?;
+    for name in inherit_env {
+        let valid = !name.is_empty()
+            && name.len() <= 128
+            && name.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_' || byte.is_ascii_uppercase() || (index > 0 && byte.is_ascii_digit())
+            });
+        if !valid {
+            return field_error("inherit_env", "contains an invalid environment name");
+        }
+    }
+    Ok(())
 }
 
 impl Validate for HarnessDefinitionV1 {

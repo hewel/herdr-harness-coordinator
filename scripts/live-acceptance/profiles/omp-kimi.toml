@@ -1,0 +1,6 @@
+schema_version = 2
+id = "omp-kimi"
+kind = "omp"
+executable = "omp"
+model = "kimi-code/k3:high"
+inherit_env = ["PATH", "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"]

@@ -24,13 +24,14 @@ use crate::{
 
 /// MCP revision implemented by the stdio bridge.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
-const REQUIRED_WORKER_TOOLS: [&str; 6] = [
+const REQUIRED_WORKER_TOOLS: [&str; 7] = [
     "harness_list",
     "harness_status",
     "harness_inbox",
     "harness_request",
     "harness_send",
     "harness_complete",
+    "harness_attachment_create",
 ];
 
 /// One identity-bound stdio MCP server.
@@ -178,6 +179,9 @@ impl McpServer {
         if name == "harness_start" {
             return self.start_worker(arguments).await;
         }
+        if name == "harness_attachment_create" {
+            return self.create_inline_attachment(arguments).await;
+        }
         let operation = match name {
             "harness_list" => query(CoordinatorQuery::HarnessStatus),
             "harness_status" => query(CoordinatorQuery::ListTasks),
@@ -282,6 +286,50 @@ impl McpServer {
         )
         .await?;
         tool_result(response)
+    }
+
+    async fn create_inline_attachment(&self, arguments: Value) -> Result<Value> {
+        let args: InlineAttachmentArgs =
+            serde_json::from_value(arguments).context("invalid inline Attachment arguments")?;
+        if args.content.is_empty() || args.content.len() > 512 * 1024 {
+            bail!("inline Attachment content must contain 1 to 524288 UTF-8 bytes");
+        }
+        if args.media_type.is_empty() || args.media_type.len() > 255 {
+            bail!("inline Attachment media_type must contain 1 to 255 bytes");
+        }
+        if args.original_name.is_empty() || args.original_name.len() > 255 {
+            bail!("inline Attachment original_name must contain 1 to 255 bytes");
+        }
+        let state_dir = self
+            .workspace_state_dir
+            .as_deref()
+            .or_else(|| self.socket.parent())
+            .context("Coordinator socket has no state directory")?;
+        let temporary_dir = state_dir.join("tmp");
+        tokio::fs::create_dir_all(&temporary_dir).await?;
+        let temporary =
+            temporary_dir.join(format!("inline-attachment-{}.tmp", uuid::Uuid::now_v7()));
+        tokio::fs::write(&temporary, args.content).await?;
+        let response = call(
+            &self.socket,
+            &BrokerRequest {
+                schema_version: SCHEMA_VERSION,
+                request_id: uuid::Uuid::now_v7().to_string(),
+                operation: BrokerOperation::Execute {
+                    actor: ActorContext::Session {
+                        capability: self.capability.clone(),
+                    },
+                    command: CoordinatorCommand::AdmitAttachment {
+                        source: temporary.clone(),
+                        media_type: args.media_type,
+                        original_name: args.original_name,
+                    },
+                },
+            },
+        )
+        .await;
+        let _ = tokio::fs::remove_file(temporary).await;
+        tool_result(response?)
     }
 
     fn complete_operation(&self, arguments: Value) -> Result<ToolOperation> {
@@ -400,7 +448,7 @@ impl McpServer {
             .or_else(|| self.socket.parent())
             .context("Coordinator socket has no state directory")?;
         pane.env.insert(
-            "HERDR_PLUGIN_STATE_DIR".to_owned(),
+            "HERDR_COORDINATOR_STATE_DIR".to_owned(),
             state_dir.to_string_lossy().into_owned(),
         );
         pane.env.insert(
@@ -544,6 +592,13 @@ struct StartArgs {
 }
 
 #[derive(Deserialize)]
+struct InlineAttachmentArgs {
+    content: String,
+    media_type: String,
+    original_name: String,
+}
+
+#[derive(Deserialize)]
 struct ApproveArgs {
     task_id: TaskId,
     result_revision: u32,
@@ -658,6 +713,11 @@ fn tools() -> Vec<Value> {
             "harness_complete",
             "Submit one Result candidate for the current native turn.",
             passthrough.clone(),
+        ),
+        tool(
+            "harness_attachment_create",
+            "Create one immutable, Coordinator-owned text evidence Attachment and return its Attachment ID.",
+            json!({"type":"object","required":["content","media_type","original_name"],"properties":{"content":{"type":"string","minLength":1,"maxLength":524_288},"media_type":{"type":"string","minLength":1,"maxLength":255},"original_name":{"type":"string","minLength":1,"maxLength":255}},"additionalProperties":false}),
         ),
         tool(
             "harness_repository_observe",

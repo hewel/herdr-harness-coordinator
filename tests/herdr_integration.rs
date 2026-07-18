@@ -79,6 +79,18 @@ fn worker_open_request_is_unfocused_and_carries_the_durable_session_capability()
 }
 
 #[test]
+fn supervisor_open_request_preserves_the_plugin_root_for_command_resolution() {
+    let request = PluginPaneOpenParams::supervisor(
+        "supervisor-capability-1",
+        &PathBuf::from("/repo"),
+        Some("4".to_owned()),
+    );
+
+    assert_eq!(request.entrypoint, "supervisor");
+    assert_eq!(request.cwd, None);
+}
+
+#[test]
 fn popup_open_request_targets_the_invoking_workspace() {
     let request = PluginPaneOpenParams::popup("wF".to_owned());
 
@@ -193,7 +205,8 @@ fn worker_script_forwards_the_session_capability_and_inherited_herdr_environment
         std::process::Command::new(root.join("plugin/herdr-harness-coordinator/scripts/worker"))
             .env("HERDR_COORDINATOR_BIN", "/bin/echo")
             .env("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
-            .env("HERDR_PLUGIN_STATE_DIR", "/tmp/coordinator-state")
+            .env("HERDR_PLUGIN_STATE_DIR", "/tmp/plugin-state")
+            .env("HERDR_COORDINATOR_STATE_DIR", "/tmp/coordinator-state")
             .env("HERDR_HARNESS_SESSION_ID", "session-capability-1")
             .env("HERDR_HARNESS_CWD", &root)
             .output()
@@ -202,7 +215,28 @@ fn worker_script_forwards_the_session_capability_and_inherited_herdr_environment
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "worker-host --session-id session-capability-1\n"
+        "worker-host --session-id session-capability-1 --state-dir /tmp/coordinator-state\n"
+    );
+}
+
+#[test]
+fn supervisor_script_uses_the_explicit_workspace_state_directory() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = std::process::Command::new(
+        root.join("plugin/herdr-harness-coordinator/scripts/supervisor"),
+    )
+    .env("HERDR_COORDINATOR_BIN", "/bin/echo")
+    .env("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
+    .env("HERDR_PLUGIN_STATE_DIR", "/tmp/plugin-state")
+    .env("HERDR_COORDINATOR_STATE_DIR", "/tmp/coordinator-state")
+    .env("HERDR_SUPERVISOR_CAPABILITY", "supervisor-capability-1")
+    .output()
+    .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "supervisor-host --state-dir /tmp/coordinator-state\n"
     );
 }
 

@@ -28,9 +28,15 @@ fn spec(temp: &TempDir, executable: std::path::PathBuf) -> HarnessStartSpec {
         executable,
         cwd: temp.path().to_path_buf(),
         provider_state_dir: temp.path().join("state"),
-        provider_profile: Some("fixture-profile".to_owned()),
+        provider_profile: None,
         model: Some("fixture-model".to_owned()),
         config_overlays: Vec::new(),
+        codex_approval_policy: Some(
+            herdr_harness_coordinator::contract::CodexApprovalPolicy::Never,
+        ),
+        codex_sandbox_mode: Some(
+            herdr_harness_coordinator::contract::CodexSandboxMode::WorkspaceWrite,
+        ),
         environment: BTreeMap::new(),
     }
 }
@@ -62,7 +68,7 @@ while IFS= read -r line; do
       ;;
     *'"type":"get_state"'*)
       id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-      printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"sessionId":"omp-session","isStreaming":false,"queuedMessageCount":0,"model":{"id":"fixture-model"}}}\n' "$id"
+      printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"sessionId":"omp-session","isStreaming":false,"queuedMessageCount":0,"model":{"id":"provider-model-alias"}}}\n' "$id"
       ;;
     *'"type":"prompt"'*)
       id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
@@ -92,6 +98,7 @@ done
 
     assert_eq!(native.session_id.as_deref(), Some("omp-session"));
     assert_eq!(native.observed_version, "omp/17.0.4");
+    assert_eq!(native.model.as_deref(), Some("fixture-model"));
     assert_eq!(acceptance.correlation, "delivery-7");
     let mut completed = false;
     for _ in 0..4 {
@@ -162,6 +169,94 @@ done
         }
     }
     assert!(completed, "turn/completed must be terminal evidence");
+    adapter.stop().await.expect("clean Codex shutdown");
+}
+
+#[tokio::test]
+async fn codex_worker_configures_the_identity_bound_coordinator_mcp_server() {
+    let temp = TempDir::new().expect("temp directory");
+    let arguments = temp.path().join("codex-arguments");
+    let provider = executable(
+        temp.path(),
+        "fake-codex",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'codex-cli 0.144.5'; exit 0; fi
+printf '%s\n' "$@" > "$ARGS_PATH"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":"%s","result":{"serverInfo":{"name":"fixture"}}}\n' "$id" ;;
+    *'"method":"initialized"'*) ;;
+    *'"method":"thread/start"'*) printf '{"id":"%s","result":{"thread":{"id":"thread-1","cwd":"%s","model":"fixture-model"}}}\n' "$id" "$PWD" ;;
+  esac
+done
+"#,
+    );
+    let mut worker_spec = spec(&temp, provider);
+    worker_spec.environment.insert(
+        "ARGS_PATH".to_owned(),
+        arguments.to_string_lossy().into_owned(),
+    );
+    worker_spec.environment.insert(
+        "HERDR_COORDINATOR_SOCKET".to_owned(),
+        "/tmp/coordinator.sock".to_owned(),
+    );
+    worker_spec.environment.insert(
+        "HERDR_HARNESS_CAPABILITY".to_owned(),
+        "worker-capability".to_owned(),
+    );
+    let mut adapter = CodexProcessAdapter::new().with_timeouts(
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
+
+    adapter
+        .start(&worker_spec)
+        .await
+        .expect("start Codex Worker");
+
+    let arguments = fs::read_to_string(arguments).expect("captured Codex arguments");
+    assert!(arguments.contains("mcp_servers.herdr.command="));
+    assert!(arguments.contains("mcp_servers.herdr.args=[\"mcp\"]"));
+    adapter.stop().await.expect("clean Codex shutdown");
+}
+
+#[tokio::test]
+async fn codex_snapshot_does_not_request_turns_from_an_unmaterialized_thread() {
+    let temp = TempDir::new().expect("temp directory");
+    let provider = executable(
+        temp.path(),
+        "fake-codex",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'codex-cli 0.144.5'; exit 0; fi
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":"%s","result":{"serverInfo":{"name":"fixture"}}}\n' "$id" ;;
+    *'"method":"initialized"'*) ;;
+    *'"method":"thread/start"'*) printf '{"id":"%s","result":{"thread":{"id":"thread-1","cwd":"%s","model":"fixture-model"}}}\n' "$id" "$PWD" ;;
+    *'"method":"thread/read"'*'"includeTurns":true'*) printf '{"id":"%s","error":{"code":-32600,"message":"thread is not materialized yet; includeTurns is unavailable before first user message"}}\n' "$id" ;;
+    *'"method":"thread/read"'*) printf '{"id":"%s","result":{"thread":{"id":"thread-1"}}}\n' "$id" ;;
+  esac
+done
+"#,
+    );
+    let mut adapter = CodexProcessAdapter::new().with_timeouts(
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
+
+    adapter
+        .start(&spec(&temp, provider))
+        .await
+        .expect("start Codex");
+
+    adapter
+        .snapshot()
+        .await
+        .expect("snapshot unmaterialized Codex thread");
     adapter.stop().await.expect("clean Codex shutdown");
 }
 

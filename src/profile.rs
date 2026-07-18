@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::contract::{
-    HarnessId, HarnessKind, HarnessLaunchProfileV1, HarnessLaunchProfileV2, Validate,
+    CodexApprovalPolicy, CodexSandboxMode, HarnessId, HarnessKind, HarnessLaunchProfileV1,
+    HarnessLaunchProfileV2, HarnessLaunchProfileV3, Validate,
 };
 
 /// Version-neutral immutable launch profile contents.
@@ -32,6 +33,10 @@ pub struct LaunchProfileSnapshot {
     pub inherit_env: Vec<String>,
     /// OMP configuration overlays.
     pub config_overlays: Vec<PathBuf>,
+    /// Explicit Codex App Server approval policy, for v3 Codex profiles.
+    pub codex_approval_policy: Option<CodexApprovalPolicy>,
+    /// Explicit Codex App Server sandbox mode, for v3 Codex profiles.
+    pub codex_sandbox_mode: Option<CodexSandboxMode>,
 }
 
 /// Exact profile selection retained with a Harness Session.
@@ -314,6 +319,8 @@ pub fn parse_launch_profile_snapshot(snapshot: &str) -> Result<LaunchProfileSnap
                 model: profile.model,
                 inherit_env: profile.inherit_env,
                 config_overlays: profile.config_overlays,
+                codex_approval_policy: None,
+                codex_sandbox_mode: None,
             })
         }
         Some(2) => {
@@ -329,6 +336,25 @@ pub fn parse_launch_profile_snapshot(snapshot: &str) -> Result<LaunchProfileSnap
                 model: Some(profile.model),
                 inherit_env: profile.inherit_env,
                 config_overlays: profile.config_overlays,
+                codex_approval_policy: None,
+                codex_sandbox_mode: None,
+            })
+        }
+        Some(3) => {
+            let profile: HarnessLaunchProfileV3 =
+                toml::from_str(snapshot).map_err(|error| error.to_string())?;
+            profile.validate().map_err(|error| error.to_string())?;
+            Ok(LaunchProfileSnapshot {
+                schema_version: 3,
+                id: profile.id,
+                kind: profile.kind,
+                executable: profile.executable,
+                provider_profile: None,
+                model: Some(profile.model),
+                inherit_env: profile.inherit_env,
+                config_overlays: Vec::new(),
+                codex_approval_policy: Some(profile.approval_policy),
+                codex_sandbox_mode: Some(profile.sandbox_mode),
             })
         }
         Some(version) => Err(format!(

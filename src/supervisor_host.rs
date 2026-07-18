@@ -472,6 +472,10 @@ impl SupervisorAdapter for ProcessSupervisorAdapter {
                 provider_profile: spec.provider_profile.clone(),
                 model: spec.model.clone(),
                 config_overlays: spec.config_overlays.clone(),
+                codex_approval_policy: (self.adapter.kind() == HarnessKind::Codex)
+                    .then_some(crate::contract::CodexApprovalPolicy::Never),
+                codex_sandbox_mode: (self.adapter.kind() == HarnessKind::Codex)
+                    .then_some(crate::contract::CodexSandboxMode::DangerFullAccess),
                 environment: spec.environment.clone(),
             })
             .await?;

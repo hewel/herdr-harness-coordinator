@@ -335,7 +335,10 @@ impl HarnessAdapter for OmpProcessAdapter {
             session_id: field(&value, "sessionId"),
             thread_id: None,
             cwd: spec.cwd.clone(),
-            model: model(&value).or_else(|| spec.model.clone()),
+            // The CLI accepts the exact selected model before RPC startup, while
+            // `get_state` may report a provider-local alias (for example `k3`).
+            // Preserve the immutable launch selection for reuse compatibility.
+            model: spec.model.clone().or_else(|| model(&value)),
         };
         {
             let mut state = self.0.state.lock().await;
@@ -462,6 +465,10 @@ impl HarnessAdapter for CodexProcessAdapter {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Codex startup keeps the ordered native handshake and policy evidence together"
+    )]
     async fn start(&mut self, spec: &HarnessStartSpec) -> AdapterResult<NativeSession> {
         ensure_fresh(HarnessKind::Codex, self.0.runtime.as_ref())?;
         let observed_version = version(HarnessKind::Codex, &spec.executable).await?;
@@ -469,24 +476,25 @@ impl HarnessAdapter for CodexProcessAdapter {
             .await
             .map_err(|error| operation(HarnessKind::Codex, error.to_string()))?;
         let mut command = Command::new(&spec.executable);
-        if let Some(profile) = &spec.provider_profile {
-            command.arg("--profile").arg(profile);
+        if spec.provider_profile.is_some() {
+            return Err(operation(
+                HarnessKind::Codex,
+                "Codex App Server does not accept CLI profiles; use a v3 launch profile with explicit approval_policy and sandbox_mode",
+            ));
         }
-        if spec.tier == crate::contract::HarnessTier::Supervisor {
-            let coordinator = std::env::current_exe().map_err(|error| {
-                operation(
-                    HarnessKind::Codex,
-                    format!("cannot resolve Coordinator MCP executable: {error}"),
-                )
-            })?;
-            let command_value = serde_json::to_string(&coordinator.to_string_lossy())
-                .map_err(|error| operation(HarnessKind::Codex, error.to_string()))?;
-            command
-                .arg("-c")
-                .arg(format!("mcp_servers.herdr.command={command_value}"))
-                .arg("-c")
-                .arg("mcp_servers.herdr.args=[\"mcp\"]");
-        }
+        let coordinator = std::env::current_exe().map_err(|error| {
+            operation(
+                HarnessKind::Codex,
+                format!("cannot resolve Coordinator MCP executable: {error}"),
+            )
+        })?;
+        let command_value = serde_json::to_string(&coordinator.to_string_lossy())
+            .map_err(|error| operation(HarnessKind::Codex, error.to_string()))?;
+        command
+            .arg("-c")
+            .arg(format!("mcp_servers.herdr.command={command_value}"))
+            .arg("-c")
+            .arg("mcp_servers.herdr.args=[\"mcp\"]");
         command.args(["app-server", "--listen", "stdio://", "--strict-config"]);
         let (mut child, stdin, stdout) = spawn(&mut command, spec, HarnessKind::Codex)?;
         let pending = Arc::new(Mutex::new(HashMap::new()));
@@ -524,11 +532,29 @@ impl HarnessAdapter for CodexProcessAdapter {
         )
         .await?;
         let id = self.0.id();
+        let approval_policy = spec.codex_approval_policy.ok_or_else(|| {
+            operation(
+                HarnessKind::Codex,
+                "Codex App Server requires a v3 launch profile with approval_policy",
+            )
+        })?;
+        let sandbox = spec.codex_sandbox_mode.ok_or_else(|| {
+            operation(
+                HarnessKind::Codex,
+                "Codex App Server requires a v3 launch profile with sandbox_mode",
+            )
+        })?;
         let value = self
             .0
             .request(
                 HarnessKind::Codex,
-                json!({"method":"thread/start","params":{"cwd":spec.cwd,"model":spec.model,"ephemeral":false}}),
+                json!({"method":"thread/start","params":{
+                    "cwd":spec.cwd,
+                    "model":spec.model,
+                    "ephemeral":false,
+                    "approvalPolicy":approval_policy,
+                    "sandbox":sandbox
+                }}),
                 id,
             )
             .await?;
@@ -658,7 +684,7 @@ impl HarnessAdapter for CodexProcessAdapter {
         self.0
             .request(
                 HarnessKind::Codex,
-                json!({"method":"thread/read","params":{"threadId":thread,"includeTurns":true}}),
+                json!({"method":"thread/read","params":{"threadId":thread,"includeTurns":false}}),
                 id,
             )
             .await?;

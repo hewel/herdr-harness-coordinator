@@ -41,6 +41,7 @@ async fn mcp_initialization_and_tool_discovery_match_the_pinned_revision() {
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect::<Vec<_>>();
     assert!(names.contains(&"harness_complete"));
+    assert!(names.contains(&"harness_attachment_create"));
     assert!(names.contains(&"harness_task_approve"));
     assert!(names.contains(&"harness_task_graph"));
     assert!(names.contains(&"harness_hold_clear"));

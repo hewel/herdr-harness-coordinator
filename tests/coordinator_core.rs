@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use herdr_harness_coordinator::{
-    adapter::{AdapterLifecycle, AdapterSnapshot},
+    adapter::{AdapterCapabilities, AdapterLifecycle, AdapterSnapshot},
     contract::{
         AttachmentId, DeliveryIntent, DependencyCondition, DependencyFailurePolicy,
         HarnessDefinitionV1, HarnessId, HarnessKind, HarnessTier, MessageKind, MessageSubmissionV1,
@@ -12,7 +12,8 @@ use herdr_harness_coordinator::{
     },
     core::{
         ActorContext, CommandOutcome, Coordinator, CoordinatorCommand, CoordinatorQuery,
-        DeliveryUnknownResolution, QueryResult, SessionCapability, TaskSchedulingState, TaskState,
+        DeliveryUnknownResolution, HarnessCompatibilityEvidenceV1, QueryResult, SessionCapability,
+        TaskSchedulingState, TaskState,
     },
 };
 use sha2::{Digest, Sha256};
@@ -1675,6 +1676,22 @@ async fn inbox_and_popup_projections_follow_durable_read_markers() {
 }
 
 #[tokio::test]
+async fn incompatible_fresh_session_does_not_request_unbounded_rotation() {
+    let (_state, coordinator, supervisor, worker, task_id) =
+        seeded_task_with_host_model(Some("provider-model-alias")).await;
+
+    let outcome = coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::ClaimNextTask,
+        )
+        .await
+        .expect("incompatibility must become a durable blocker");
+    assert!(matches!(outcome, CommandOutcome::NoTaskAvailable));
+    assert_task_state(&coordinator, &supervisor, task_id, TaskState::Queued, 0).await;
+}
+
+#[tokio::test]
 async fn host_events_replay_idempotently_and_supervisor_can_stop_an_idle_worker() {
     let (_state, coordinator, supervisor, worker, _task_id) = seeded_task().await;
     let event = serde_json::json!({"kind":"activity","summary":"started"});
@@ -1850,6 +1867,22 @@ async fn seeded_task() -> (
     SessionCapability,
     TaskId,
 ) {
+    seeded_task_with_host_model(None).await
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the shared integration fixture constructs one complete durable coordinator state"
+)]
+async fn seeded_task_with_host_model(
+    host_model: Option<&str>,
+) -> (
+    tempfile::TempDir,
+    Coordinator,
+    SessionCapability,
+    SessionCapability,
+    TaskId,
+) {
     let state = tempfile::tempdir().expect("state directory must exist");
     let repository_root = state.path().join("project");
     std::fs::create_dir_all(repository_root.join("src")).expect("repository fixture directory");
@@ -1905,6 +1938,36 @@ async fn seeded_task() -> (
     else {
         panic!("Worker start must return a capability")
     };
+    if let Some(host_model) = host_model {
+        coordinator
+            .execute(
+                ActorContext::Session {
+                    capability: worker.clone(),
+                },
+                CoordinatorCommand::RecordHostCompatibility {
+                    resolved_executable: PathBuf::from("/usr/bin/omp"),
+                    observed_version: "omp/17.0.4".to_owned(),
+                    native_session_id: Some("native-omp".to_owned()),
+                    native_thread_id: None,
+                    effective_model: Some(host_model.to_owned()),
+                    safe_compaction: false,
+                    evidence: HarnessCompatibilityEvidenceV1 {
+                        schema_version: SCHEMA_VERSION,
+                        kind: HarnessKind::Omp,
+                        capabilities: AdapterCapabilities {
+                            persistent_session: true,
+                            active_turn_steering: true,
+                            active_turn_follow_up: true,
+                            cooperative_cancellation: true,
+                            safe_compaction: false,
+                        },
+                        successful_checks: vec!["ready".to_owned()],
+                    },
+                },
+            )
+            .await
+            .expect("compatibility evidence must persist");
+    }
     coordinator
         .execute(
             ActorContext::Session {

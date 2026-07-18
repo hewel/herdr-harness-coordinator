@@ -2,10 +2,12 @@
 set -eu
 
 : "${HERDR_SOCKET_PATH:?Herdr did not provide HERDR_SOCKET_PATH}"
-: "${HERDR_PLUGIN_STATE_DIR:?Herdr did not provide HERDR_PLUGIN_STATE_DIR}"
+: "${HERDR_COORDINATOR_STATE_DIR:?Coordinator did not provide HERDR_COORDINATOR_STATE_DIR}"
 : "${HERDR_HARNESS_SESSION_ID:?Coordinator did not provide HERDR_HARNESS_SESSION_ID}"
 : "${HERDR_HARNESS_CWD:?Coordinator did not provide HERDR_HARNESS_CWD}"
 
 coordinator_bin="${HERDR_COORDINATOR_BIN:-herdr-harness-coordinator}"
 cd "$HERDR_HARNESS_CWD"
-exec "$coordinator_bin" worker-host --session-id "$HERDR_HARNESS_SESSION_ID"
+exec "$coordinator_bin" worker-host \
+  --session-id "$HERDR_HARNESS_SESSION_ID" \
+  --state-dir "$HERDR_COORDINATOR_STATE_DIR"

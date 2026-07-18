@@ -1,5 +1,6 @@
 use herdr_harness_coordinator::contract::{
-    HarnessKind, HarnessLaunchProfileV1, HarnessLaunchProfileV2, Validate,
+    CodexApprovalPolicy, CodexSandboxMode, HarnessKind, HarnessLaunchProfileV1,
+    HarnessLaunchProfileV2, HarnessLaunchProfileV3, Validate,
 };
 
 #[test]
@@ -20,6 +21,27 @@ fn launch_profile_resolves_a_pinned_omp_configuration() {
 
     profile.validate().expect("profile must validate");
     assert_eq!(profile.kind, HarnessKind::Omp);
+}
+
+#[test]
+fn launch_profile_v3_pins_codex_app_server_execution_policy() {
+    let profile: HarnessLaunchProfileV3 = toml::from_str(
+        r#"
+        schema_version = 3
+        id = "codex-worker"
+        kind = "codex"
+        executable = "codex"
+        model = "gpt-5.6-sol"
+        approval_policy = "never"
+        sandbox_mode = "danger-full-access"
+        inherit_env = ["PATH"]
+        "#,
+    )
+    .expect("profile must deserialize");
+
+    profile.validate().expect("profile must validate");
+    assert_eq!(profile.approval_policy, CodexApprovalPolicy::Never);
+    assert_eq!(profile.sandbox_mode, CodexSandboxMode::DangerFullAccess);
 }
 
 #[test]

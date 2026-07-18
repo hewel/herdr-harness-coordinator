@@ -195,7 +195,13 @@ async fn main() -> Result<()> {
             socket,
         } => {
             let socket = socket.unwrap_or_else(|| state_dir.join("coordinator.sock"));
-            herdr_harness_coordinator::host::run_worker_host(&socket, &state_dir, session_id).await
+            let result =
+                herdr_harness_coordinator::host::run_worker_host(&socket, &state_dir, session_id)
+                    .await;
+            if let Err(error) = &result {
+                append_host_diagnostic(&state_dir, "worker-host", error).await;
+            }
+            result
         }
         Command::SupervisorHost {
             supervisor_capability,
@@ -211,6 +217,9 @@ async fn main() -> Result<()> {
                 supervisor_capability,
             )
             .await;
+            if let Err(error) = &result {
+                append_host_diagnostic(&state_dir, "supervisor-host", error).await;
+            }
             remove_file_if_present(&pid_path).await?;
             result
         }
@@ -237,6 +246,28 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+async fn append_host_diagnostic(state_dir: &Path, host: &str, error: &anyhow::Error) {
+    let path = state_dir.join(format!("{host}.log"));
+    let Ok(mut log) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    else {
+        return;
+    };
+    let _ = log
+        .write_all(
+            format!(
+                "{}\t{}\n",
+                chrono::Utc::now().to_rfc3339(),
+                format_args!("{error:#}")
+            )
+            .as_bytes(),
+        )
+        .await;
 }
 
 async fn run_workspace(state_dir: PathBuf, command: WorkspaceCommand) -> Result<()> {
@@ -374,15 +405,21 @@ async fn activate_workspace(
     if !socket_is_live(&socket).await {
         remove_file_if_present(&socket).await?;
         let executable = std::env::current_exe().context("resolving Coordinator executable")?;
+        let daemon_log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(view.state_dir.join("coordinator-daemon.log"))?;
         let child = tokio::process::Command::new(&executable)
             .arg("daemon")
             .arg("--state-dir")
             .arg(&view.state_dir)
             .arg("--socket")
             .arg(&socket)
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(daemon_log))
             .spawn()
             .context("starting workspace Coordinator daemon")?;
         let pid = child.id().context("workspace daemon has no process ID")?;
@@ -408,7 +445,7 @@ async fn activate_workspace(
             Some(view.workspace_id.clone()),
         );
         pane.env.insert(
-            "HERDR_PLUGIN_STATE_DIR".to_owned(),
+            "HERDR_COORDINATOR_STATE_DIR".to_owned(),
             view.state_dir.to_string_lossy().into_owned(),
         );
         pane.env.insert(

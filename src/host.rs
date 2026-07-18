@@ -125,6 +125,8 @@ async fn run_worker_host_inner(
         provider_profile: profile.provider_profile,
         model: profile.model,
         config_overlays: profile.config_overlays,
+        codex_approval_policy: profile.codex_approval_policy,
+        codex_sandbox_mode: profile.codex_sandbox_mode,
         environment,
     };
     tokio::fs::create_dir_all(&spec.provider_state_dir)
@@ -722,7 +724,11 @@ async fn resolve_delivery(
                 .into_iter()
                 .map(|dependency| dependency.attachment_id),
         );
-        (task.instructions, DeliveryIntent::FollowUp, attachments)
+        (
+            worker_task_prompt(task_id, &task.instructions),
+            DeliveryIntent::FollowUp,
+            attachments,
+        )
     } else {
         let message: MessageSubmissionV1 =
             serde_json::from_value(message.body.clone()).context("decoding Bus Message")?;
@@ -776,6 +782,14 @@ async fn resolve_delivery(
         text,
         attachments,
     }))
+}
+
+/// Formats the native Worker prompt for one Task and preserves structured Result authority.
+#[must_use]
+pub fn worker_task_prompt(task_id: crate::contract::TaskId, instructions: &str) -> String {
+    format!(
+        "{instructions}\n\nCoordinator completion contract:\n- This is Task {task_id}.\n- Normal assistant text is not a Result and does not complete the Task.\n- Execute the requested verification command(s).\n- The Coordinator tools are on the `herdr` MCP server. In Codex, invoke them through the orchestration tool as `tools.mcp__herdr__harness_attachment_create(...)` and `tools.mcp__herdr__harness_complete(...)`; provider UIs may display the shorter names.\n- Call `harness_attachment_create` with the exact verification output to create immutable evidence.\n- Then call `harness_complete` exactly once with the current native turn ID and a `manifest` containing schema_version 1, this task_id, summary, changed_files, at least one verification entry referencing the returned Attachment ID, deviations, risks, and attachments.\n- Do not finish the native turn until `harness_complete` reports that the Result was recorded."
+    )
 }
 
 async fn dispatch_with_safe_retries(

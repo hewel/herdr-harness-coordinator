@@ -2,10 +2,24 @@ use std::{path::PathBuf, sync::Arc};
 
 use herdr_harness_coordinator::{
     broker::BrokerServer,
-    contract::{HarnessDefinitionV1, HarnessKind, HarnessTier, SCHEMA_VERSION},
+    contract::{HarnessDefinitionV1, HarnessKind, HarnessTier, SCHEMA_VERSION, TaskId},
     core::{ActorContext, CommandOutcome, Coordinator, CoordinatorCommand},
-    host::render_popup,
+    host::{render_popup, worker_task_prompt},
 };
+
+#[test]
+fn worker_task_prompt_requires_a_structured_result_at_the_coordinator_boundary() {
+    let task_id =
+        TaskId(uuid::Uuid::parse_str("019f7606-a26b-7a41-87dd-95f3a072a226").expect("Task ID"));
+
+    let prompt = worker_task_prompt(task_id, "Inspect Cargo.toml without editing files.");
+
+    assert!(prompt.contains("Inspect Cargo.toml without editing files."));
+    assert!(prompt.contains("harness_complete"));
+    assert!(prompt.contains("tools.mcp__herdr__harness_complete"));
+    assert!(prompt.contains("019f7606-a26b-7a41-87dd-95f3a072a226"));
+    assert!(prompt.contains("Normal assistant text is not a Result"));
+}
 
 #[tokio::test]
 async fn popup_renders_durable_state_through_the_real_broker_boundary() {

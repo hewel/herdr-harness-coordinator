@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/harness-coordinator/harness-launch-profile-v3.schema.json",
+  "title": "HarnessLaunchProfileV3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "id", "kind", "executable", "model", "approval_policy", "sandbox_mode"],
+  "properties": {
+    "schema_version": { "const": 3 },
+    "id": { "$ref": "common-v1.schema.json#/$defs/harnessId" },
+    "kind": { "const": "codex" },
+    "executable": {
+      "type": "string",
+      "minLength": 1,
+      "oneOf": [
+        { "$ref": "common-v1.schema.json#/$defs/absolutePath" },
+        { "pattern": "^[^/\\\\]+$" }
+      ]
+    },
+    "model": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "approval_policy": { "enum": ["untrusted", "on-request", "never"] },
+    "sandbox_mode": { "enum": ["read-only", "workspace-write", "danger-full-access"] },
+    "inherit_env": {
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]{0,127}$" }
+    }
+  }
+}
