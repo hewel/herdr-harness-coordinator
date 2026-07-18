@@ -158,8 +158,8 @@ pub struct ResolvedAttachment {
 pub struct ResolvedDelivery {
     /// Unique host-generated provider request correlation.
     pub correlation: String,
-    /// Task whose top-level conversation receives the input.
-    pub task_id: TaskId,
+    /// Task whose top-level conversation receives the input, absent for network Notifications.
+    pub task_id: Option<TaskId>,
     /// Resolved provider operation.
     pub kind: NativeDeliveryKind,
     /// Prompt, Reply, Correction, or Notification text.

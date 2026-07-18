@@ -37,7 +37,7 @@ fn spec(temp: &TempDir, executable: std::path::PathBuf) -> HarnessStartSpec {
 fn delivery(kind: NativeDeliveryKind) -> ResolvedDelivery {
     ResolvedDelivery {
         correlation: "delivery-7".to_owned(),
-        task_id: TaskId::new(),
+        task_id: Some(TaskId::new()),
         kind,
         text: "do the bounded work".to_owned(),
         attachments: Vec::new(),

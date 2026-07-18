@@ -82,11 +82,26 @@ async fn run_worker_host_inner(
     if profile.kind != session.definition.kind {
         bail!("Worker Harness Kind differs from its durable launch profile");
     }
-    let environment = profile
+    let mut environment = profile
         .inherit_env
         .iter()
         .filter_map(|name| std::env::var(name).ok().map(|value| (name.clone(), value)))
         .collect::<BTreeMap<_, _>>();
+    environment.insert(
+        "HERDR_HARNESS_CAPABILITY".to_owned(),
+        serde_json::to_value(&capability)?
+            .as_str()
+            .context("Session capability did not serialize as a bearer")?
+            .to_owned(),
+    );
+    environment.insert(
+        "HERDR_COORDINATOR_SOCKET".to_owned(),
+        socket.to_string_lossy().into_owned(),
+    );
+    environment.insert(
+        "HERDR_PLUGIN_STATE_DIR".to_owned(),
+        state_dir.to_string_lossy().into_owned(),
+    );
     let spec = HarnessStartSpec {
         session_id: session.session_id,
         executable: profile.executable,
@@ -102,6 +117,9 @@ async fn run_worker_host_inner(
     tokio::fs::create_dir_all(&spec.provider_state_dir)
         .await
         .context("creating provider Session state directory")?;
+    crate::mcp::verify_required_worker_tools(socket, capability.clone())
+        .await
+        .context("verifying required Coordinator tools")?;
     let mut adapter: Box<dyn HarnessAdapter> = match profile.kind {
         HarnessKind::Omp => Box::new(OmpProcessAdapter::new()),
         HarnessKind::Codex => Box::new(CodexProcessAdapter::new()),
@@ -110,8 +128,16 @@ async fn run_worker_host_inner(
         .start(&spec)
         .await
         .context("starting native Harness")?;
+    broker_execute(
+        socket,
+        capability.clone(),
+        CoordinatorCommand::RecordHostReady,
+    )
+    .await?;
     let mut events = adapter.events();
     let mut current_task = None;
+    let mut cancellation_requested = None;
+    let mut cancellation_started = None;
     let mut event_sequence = session.event_sequence;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     loop {
@@ -125,14 +151,13 @@ async fn run_worker_host_inner(
                 let inbox = broker_query(socket, capability.clone(), CoordinatorQuery::Inbox).await?;
                 let QueryResult::Inbox(messages) = inbox else { bail!("broker returned the wrong inbox projection") };
                 if let Some(message) = messages.first() {
-                    let task_id = message.task_id.context("Worker inbox contained a network Message")?;
                     let Some(delivery) = resolve_delivery(
                         adapter.as_mut(),
                         socket,
                         state_dir,
                         capability.clone(),
                         message,
-                        task_id,
+                        message.task_id,
                     ).await? else {
                         continue;
                     };
@@ -145,9 +170,11 @@ async fn run_worker_host_inner(
                             broker_execute(socket, capability.clone(), CoordinatorCommand::MarkInboxRead {
                                 message_ids: vec![message.id],
                             }).await?;
-                            current_task = Some(task_id);
+                            if let Some(task_id) = message.task_id {
+                                current_task = Some(task_id);
+                            }
                         }
-                        Err(error) if error.to_string().contains("unknown") || error.to_string().contains("after write") => {
+                        Err(error) if error.provider_bytes_may_have_been_written() => {
                             broker_execute(socket, capability.clone(), CoordinatorCommand::MarkDeliveryUnknown {
                                 message_id: message.id,
                                 diagnostic: error.to_string(),
@@ -161,13 +188,28 @@ async fn run_worker_host_inner(
                 let tasks = broker_query(socket, capability.clone(), CoordinatorQuery::ListTasks).await?;
                 if let QueryResult::Tasks(tasks) = tasks
                     && let Some(task) = tasks.iter().find(|task| task.worker_id == session.definition.id && task.state == TaskState::Cancelling)
+                    && cancellation_requested != Some(task.id)
                 {
-                    adapter.cancel_active().await.context("cooperatively cancelling native turn")?;
+                    if current_task == Some(task.id) {
+                        adapter.cancel_active().await.context("cooperatively cancelling native turn")?;
+                        cancellation_requested = Some(task.id);
+                        cancellation_started = Some(tokio::time::Instant::now());
+                    } else {
+                        broker_execute(socket, capability.clone(), CoordinatorCommand::RecordCancellationCompleted {
+                            task_id: task.id,
+                            succeeded: true,
+                        }).await?;
+                    }
+                }
+                if let (Some(task_id), Some(started)) = (cancellation_requested, cancellation_started)
+                    && started.elapsed() >= Duration::from_secs(15)
+                {
                     broker_execute(socket, capability.clone(), CoordinatorCommand::RecordCancellationCompleted {
-                        task_id: task.id,
-                        succeeded: true,
+                        task_id,
+                        succeeded: false,
                     }).await?;
-                    current_task = None;
+                    adapter.stop().await.ok();
+                    bail!("cooperative cancellation timed out");
                 }
                 let session_state = broker_query(socket, capability.clone(), CoordinatorQuery::SessionSelf).await?;
                 let QueryResult::Session(session_state) = session_state else {
@@ -200,11 +242,24 @@ async fn run_worker_host_inner(
                         match event {
                             AdapterEvent::TurnCompleted { turn_id, status } => {
                                 if let Some(task_id) = current_task.take() {
-                                    broker_execute(socket, capability.clone(), CoordinatorCommand::RecordTurnCompleted {
-                                        task_id,
-                                        native_turn_id: turn_id.unwrap_or_else(|| "provider-turn".to_owned()),
-                                        succeeded: status == NativeTurnStatus::Completed,
-                                    }).await?;
+                                    let task = broker_query(socket, capability.clone(), CoordinatorQuery::GetTask { task_id }).await?;
+                                    let QueryResult::Task(task) = task else {
+                                        bail!("broker returned the wrong Task projection")
+                                    };
+                                    if task.state == TaskState::Cancelling {
+                                        broker_execute(socket, capability.clone(), CoordinatorCommand::RecordCancellationCompleted {
+                                            task_id,
+                                            succeeded: matches!(status, NativeTurnStatus::Interrupted | NativeTurnStatus::Completed),
+                                        }).await?;
+                                        cancellation_requested = None;
+                                        cancellation_started = None;
+                                    } else {
+                                        broker_execute(socket, capability.clone(), CoordinatorCommand::RecordTurnCompleted {
+                                            task_id,
+                                            native_turn_id: turn_id.unwrap_or_else(|| "provider-turn".to_owned()),
+                                            succeeded: status == NativeTurnStatus::Completed,
+                                        }).await?;
+                                    }
                                 }
                             }
                             AdapterEvent::Failed { message } => return Err(anyhow!(message)),
@@ -238,12 +293,16 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
     let capability = SessionCapability::from_bearer(bearer)?;
     let status = broker_query(socket, capability.clone(), CoordinatorQuery::HarnessStatus).await?;
     let tasks = broker_query(socket, capability.clone(), CoordinatorQuery::ListTasks).await?;
+    let inbox = broker_query(socket, capability.clone(), CoordinatorQuery::Inbox).await?;
     let holds = broker_query(socket, capability, CoordinatorQuery::ActiveHolds).await?;
     let QueryResult::HarnessStatus(status) = status else {
         bail!("invalid Harness status response")
     };
     let QueryResult::Tasks(tasks) = tasks else {
         bail!("invalid Task list response")
+    };
+    let QueryResult::Inbox(inbox) = inbox else {
+        bail!("invalid inbox response")
     };
     let QueryResult::Holds(holds) = holds else {
         bail!("invalid Hold list response")
@@ -270,6 +329,17 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
             output,
             "{} · {} · {:?} · revision {}",
             task.id, task.worker_id, task.state, task.result_revision
+        );
+    }
+    output.push_str("\nInbox\n");
+    for message in inbox {
+        let _ = writeln!(
+            output,
+            "{} · {} · {} · {}",
+            message.id,
+            message.sender_id,
+            message.kind,
+            message.delivery_state.as_deref().unwrap_or("pending")
         );
     }
     if !holds.is_empty() {
@@ -443,7 +513,7 @@ async fn resolve_delivery(
     state_dir: &Path,
     capability: SessionCapability,
     message: &InboxMessageView,
-    task_id: crate::contract::TaskId,
+    task_id: Option<crate::contract::TaskId>,
 ) -> Result<Option<ResolvedDelivery>> {
     let (text, intent, attachment_ids) = if message.kind == "task" {
         let task: TaskSubmissionV1 =

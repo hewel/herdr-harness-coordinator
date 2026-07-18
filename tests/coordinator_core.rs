@@ -263,6 +263,202 @@ async fn worker_host_failure_records_repository_evidence_and_a_hold() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "end-to-end proof covers capture, Result delivery, Hold, and approval rejection"
+)]
+async fn out_of_scope_result_is_delivered_for_review_but_cannot_be_approved() {
+    let (state, coordinator, supervisor, worker, task_id) = seeded_task().await;
+    let evidence_path = state.path().join("verification.txt");
+    std::fs::write(&evidence_path, "focused verification passed\n").expect("evidence fixture");
+    let CommandOutcome::AttachmentAdmitted { attachment } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::AdmitAttachment {
+                source: evidence_path,
+                media_type: "text/plain".to_owned(),
+                original_name: "verification.txt".to_owned(),
+            },
+        )
+        .await
+        .expect("evidence admission must succeed")
+    else {
+        panic!("admission must return metadata")
+    };
+    let CommandOutcome::TaskDispatching { message_id, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::DispatchTask { task_id },
+        )
+        .await
+        .expect("Task must dispatch")
+    else {
+        panic!("dispatch must return its Message")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::AcceptDelivery {
+                message_id,
+                native_correlation: "turn-out-of-scope".to_owned(),
+            },
+        )
+        .await
+        .expect("Task delivery must be accepted");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::CompleteTask {
+                manifest: result_manifest(task_id, "unsafe result", attachment.id),
+                native_turn_id: "turn-out-of-scope".to_owned(),
+            },
+        )
+        .await
+        .expect("Result candidate must be retained");
+    coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::RecordTurnCompleted {
+                task_id,
+                native_turn_id: "turn-out-of-scope".to_owned(),
+                succeeded: true,
+            },
+        )
+        .await
+        .expect("terminal evidence must preserve the Result for review");
+    std::fs::write(state.path().join("project/outside.txt"), "unauthorized\n")
+        .expect("post-Result out-of-scope fixture");
+
+    let QueryResult::Inbox(inbox) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::Inbox,
+        )
+        .await
+        .expect("Supervisor inbox query")
+    else {
+        panic!("inbox query must return Messages")
+    };
+    assert!(inbox.iter().any(|message| message.kind == "result"));
+    let CommandOutcome::ObservationRecorded { digest, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CaptureRepositoryObservation {
+                task_id,
+                checkpoint: ObservationCheckpoint::Approval,
+            },
+        )
+        .await
+        .expect("approval checkpoint must capture")
+    else {
+        panic!("capture must return digest")
+    };
+    let error = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::ApproveTask {
+                task_id,
+                result_revision: 0,
+                observation_digest: digest,
+            },
+        )
+        .await
+        .expect_err("Hold must prevent approval");
+    assert_eq!(
+        error.category,
+        herdr_harness_coordinator::core::ErrorCategory::RepositoryBlocked
+    );
+    let QueryResult::Holds(holds) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::ActiveHolds,
+        )
+        .await
+        .expect("Hold query")
+    else {
+        panic!("Hold query must return Holds")
+    };
+    assert_eq!(holds.len(), 1);
+}
+
+#[tokio::test]
+async fn repository_observation_failure_fails_active_task_and_creates_hold() {
+    let (state, coordinator, supervisor, worker, task_id) = seeded_task().await;
+    let CommandOutcome::TaskDispatching { message_id, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::DispatchTask { task_id },
+        )
+        .await
+        .expect("Task must dispatch")
+    else {
+        panic!("dispatch must return its Message")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::AcceptDelivery {
+                message_id,
+                native_correlation: "turn-repository-loss".to_owned(),
+            },
+        )
+        .await
+        .expect("Task delivery must be accepted");
+    std::fs::rename(
+        state.path().join("project/.git"),
+        state.path().join("removed-git"),
+    )
+    .expect("repository fixture must become unavailable");
+    coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::RecordTurnCompleted {
+                task_id,
+                native_turn_id: "turn-repository-loss".to_owned(),
+                succeeded: false,
+            },
+        )
+        .await
+        .expect("evidence failure must settle conservatively");
+
+    assert_task_state(&coordinator, &supervisor, task_id, TaskState::Failed, 0).await;
+    let QueryResult::Holds(holds) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::ActiveHolds,
+        )
+        .await
+        .expect("Hold query")
+    else {
+        panic!("Hold query must return Holds")
+    };
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].reason, "repository_observation_failed");
+}
+
+#[tokio::test]
 #[expect(clippy::too_many_lines, reason = "single end-to-end lifecycle proof")]
 async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
     let (state, coordinator, supervisor, worker, task_id) = seeded_task().await;
@@ -948,6 +1144,15 @@ async fn seeded_task() -> (
     else {
         panic!("Worker start must return a capability")
     };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::RecordHostReady,
+        )
+        .await
+        .expect("test Worker Host must become ready");
     let CommandOutcome::TaskCreated { task_id, .. } = coordinator
         .execute(
             ActorContext::Session {

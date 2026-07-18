@@ -10,14 +10,23 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::{
     broker::{BrokerOperation, BrokerRequest, BrokerResponse, call},
     contract::{
-        HarnessId, MessageSubmissionV1, ObservationCheckpoint, ResultManifestV1, SCHEMA_VERSION,
-        TaskId,
+        HarnessDefinitionV1, HarnessId, MessageSubmissionV1, ObservationCheckpoint,
+        ResultManifestV1, SCHEMA_VERSION, TaskId,
     },
     core::{ActorContext, CoordinatorCommand, CoordinatorQuery, SessionCapability},
+    herdr::{HerdrSocketClient, PluginPaneOpenParams},
 };
 
 /// MCP revision implemented by the stdio bridge.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const REQUIRED_WORKER_TOOLS: [&str; 6] = [
+    "harness_list",
+    "harness_status",
+    "harness_inbox",
+    "harness_request",
+    "harness_send",
+    "harness_complete",
+];
 
 /// One identity-bound stdio MCP server.
 #[derive(Debug, Clone)]
@@ -118,6 +127,9 @@ impl McpServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        if name == "harness_start" {
+            return self.start_worker(arguments).await;
+        }
         let operation = match name {
             "harness_list" => query(CoordinatorQuery::HarnessStatus),
             "harness_status" => query(CoordinatorQuery::ListTasks),
@@ -204,6 +216,123 @@ impl McpServer {
         .await?;
         tool_result(response)
     }
+
+    async fn start_worker(&self, arguments: Value) -> Result<Value> {
+        let args: StartArgs =
+            serde_json::from_value(arguments).context("invalid Worker start arguments")?;
+        let definition = args.definition.clone();
+        let worker_id = definition.id.clone();
+        let request = BrokerRequest {
+            schema_version: SCHEMA_VERSION,
+            request_id: uuid::Uuid::now_v7().to_string(),
+            operation: BrokerOperation::Execute {
+                actor: ActorContext::Session {
+                    capability: self.capability.clone(),
+                },
+                command: CoordinatorCommand::StartWorker {
+                    definition: args.definition,
+                    profile_snapshot: args.profile_snapshot,
+                    profile_digest: args.profile_digest,
+                },
+            },
+        };
+        let mut last_error = None;
+        let mut response = None;
+        for _ in 0..3 {
+            match call(&self.socket, &request).await {
+                Ok(value) => {
+                    response = Some(value);
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+        let response = response.ok_or_else(|| {
+            last_error.expect("three failed broker attempts retain the final error")
+        })?;
+        if let Some(error) = response.error {
+            bail!("Coordinator {:?}: {}", error.category, error.message);
+        }
+        let launch = async {
+            let structured = response
+                .result
+                .context("Coordinator response omitted Worker start result")?;
+            let outcome: crate::core::CommandOutcome = serde_json::from_value(structured.clone())?;
+            let crate::core::CommandOutcome::WorkerStarted { capability, .. } = outcome else {
+                bail!("Coordinator returned the wrong Worker start outcome")
+            };
+            let bearer = serde_json::to_value(capability)?
+                .as_str()
+                .context("Session capability did not serialize as a bearer")?
+                .to_owned();
+            let socket_path = std::env::var_os("HERDR_SOCKET_PATH")
+                .map(PathBuf::from)
+                .context("HERDR_SOCKET_PATH is required to open a Worker pane")?;
+            HerdrSocketClient::new(socket_path)
+                .open_worker(PluginPaneOpenParams::worker(&bearer, &definition.cwd, None))
+                .await
+                .context("opening Herdr Worker pane")?;
+            let public = json!({"worker_id": worker_id, "presence": "starting"});
+            Ok(json!({
+                "content": [{"type":"text","text":serde_json::to_string_pretty(&public)?}],
+                "structuredContent": public,
+                "isError": false
+            }))
+        }
+        .await;
+        if let Err(error) = &launch {
+            let _ = call(
+                &self.socket,
+                &BrokerRequest {
+                    schema_version: SCHEMA_VERSION,
+                    request_id: uuid::Uuid::now_v7().to_string(),
+                    operation: BrokerOperation::Execute {
+                        actor: ActorContext::Session {
+                            capability: self.capability.clone(),
+                        },
+                        command: CoordinatorCommand::AbortWorkerStart {
+                            worker_id: worker_id.clone(),
+                            diagnostic: error.to_string(),
+                        },
+                    },
+                },
+            )
+            .await;
+        }
+        launch
+    }
+}
+
+/// Verifies the identity-bound Worker tool surface before a native Harness becomes online.
+///
+/// # Errors
+///
+/// Returns an error when the local bridge omits any required Worker operation.
+pub async fn verify_required_worker_tools(
+    socket: &Path,
+    capability: SessionCapability,
+) -> Result<()> {
+    let server = McpServer::new(socket.to_path_buf(), capability);
+    let response = server
+        .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .await
+        .context("tools/list unexpectedly returned no response")?;
+    let tools = response
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .context("tools/list omitted its tool array")?;
+    for required in REQUIRED_WORKER_TOOLS {
+        if !tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(required))
+        {
+            bail!("Coordinator MCP bridge omitted required tool `{required}`");
+        }
+    }
+    Ok(())
 }
 
 enum ToolOperation {
@@ -223,6 +352,13 @@ fn query(query: CoordinatorQuery) -> ToolOperation {
 struct CompleteArgs {
     manifest: ResultManifestV1,
     native_turn_id: String,
+}
+
+#[derive(Deserialize)]
+struct StartArgs {
+    definition: HarnessDefinitionV1,
+    profile_snapshot: String,
+    profile_digest: String,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +423,11 @@ fn tools() -> Vec<Value> {
             "harness_inbox",
             "Read unread Messages for this Harness.",
             empty,
+        ),
+        tool(
+            "harness_start",
+            "Register an explicit Worker and open its unfocused Herdr pane.",
+            passthrough.clone(),
         ),
         tool(
             "harness_task_create",
