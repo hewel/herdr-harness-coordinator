@@ -457,6 +457,7 @@ done
     let arguments = fs::read_to_string(arguments).expect("captured Codex arguments");
     assert!(arguments.contains("mcp_servers.herdr.command="));
     assert!(arguments.contains("mcp_servers.herdr.args=[\"mcp\"]"));
+    assert!(arguments.contains("mcp_servers.herdr.env_vars=[\"HERDR_HARNESS_CAPABILITY\",\"HERDR_HARNESS_ACTOR\",\"HERDR_PLUGIN_STATE_DIR\",\"HERDR_COORDINATOR_SOCKET\"]"));
     adapter.stop().await.expect("clean Codex shutdown");
 }
 

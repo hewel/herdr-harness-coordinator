@@ -409,7 +409,9 @@ impl CodexProcessAdapter {
             .arg("-c")
             .arg(format!("mcp_servers.herdr.command={command_value}"))
             .arg("-c")
-            .arg("mcp_servers.herdr.args=[\"mcp\"]");
+            .arg("mcp_servers.herdr.args=[\"mcp\"]")
+            .arg("-c")
+            .arg("mcp_servers.herdr.env_vars=[\"HERDR_HARNESS_CAPABILITY\",\"HERDR_HARNESS_ACTOR\",\"HERDR_PLUGIN_STATE_DIR\",\"HERDR_COORDINATOR_SOCKET\"]");
         command.args(["app-server", "--listen", "stdio://", "--strict-config"]);
         let (mut child, stdin, stdout) = spawn(&mut command, spec, HarnessKind::Codex)?;
         let pending = Arc::new(Mutex::new(HashMap::new()));
