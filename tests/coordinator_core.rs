@@ -63,7 +63,25 @@ async fn supervisor_registration_makes_the_harness_queryable() {
 
 #[tokio::test]
 async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
-    let (_state, coordinator, supervisor, worker, task_id) = seeded_task().await;
+    let (state, coordinator, supervisor, worker, task_id) = seeded_task().await;
+    let evidence_path = state.path().join("verification.txt");
+    std::fs::write(&evidence_path, "all focused tests passed\n").expect("evidence fixture");
+    let CommandOutcome::AttachmentAdmitted { attachment } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::AdmitAttachment {
+                source: evidence_path,
+                media_type: "text/plain".to_owned(),
+                original_name: "verification.txt".to_owned(),
+            },
+        )
+        .await
+        .expect("Worker may admit immutable Result evidence")
+    else {
+        panic!("admission must return Attachment metadata")
+    };
     let CommandOutcome::TaskDispatching { message_id, .. } = coordinator
         .execute(
             ActorContext::Session {
@@ -156,7 +174,7 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
                 capability: worker.clone(),
             },
             CoordinatorCommand::CompleteTask {
-                manifest: result_manifest(task_id, "first result"),
+                manifest: result_manifest(task_id, "first result", attachment.id),
                 native_turn_id: "turn-2".to_owned(),
             },
         )
@@ -221,7 +239,7 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
                 capability: worker.clone(),
             },
             CoordinatorCommand::CompleteTask {
-                manifest: result_manifest(task_id, "corrected result"),
+                manifest: result_manifest(task_id, "corrected result", attachment.id),
                 native_turn_id: "turn-3".to_owned(),
             },
         )
@@ -545,7 +563,7 @@ fn message(
     }
 }
 
-fn result_manifest(task_id: TaskId, summary: &str) -> ResultManifestV1 {
+fn result_manifest(task_id: TaskId, summary: &str, evidence: AttachmentId) -> ResultManifestV1 {
     ResultManifestV1 {
         schema_version: SCHEMA_VERSION,
         task_id,
@@ -555,7 +573,7 @@ fn result_manifest(task_id: TaskId, summary: &str) -> ResultManifestV1 {
             command: "cargo test".to_owned(),
             exit_code: 0,
             passed: true,
-            evidence: AttachmentId::new(),
+            evidence,
         }],
         deviations: Vec::new(),
         risks: Vec::new(),

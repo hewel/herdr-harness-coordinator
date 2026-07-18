@@ -16,6 +16,7 @@ use sqlx::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::attachment::{AttachmentMetadata, AttachmentStore};
 use crate::contract::{
     DeliveryAttemptId, DeliveryIntent, HarnessDefinitionV1, HarnessId, HarnessSessionId,
     HarnessTier, MessageId, MessageKind, MessageSubmissionV1, RepositoryAccess,
@@ -113,6 +114,12 @@ pub enum ActorContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum CoordinatorCommand {
+    /// Copy a regular file into immutable Coordinator-owned storage.
+    AdmitAttachment {
+        source: PathBuf,
+        media_type: String,
+        original_name: String,
+    },
     /// Register the sole Supervisor and create its live Session.
     RegisterSupervisor { definition: HarnessDefinitionV1 },
     /// Create or reactivate an explicit Worker Harness.
@@ -283,6 +290,8 @@ pub struct TaskView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandOutcome {
+    /// File was copied, hashed, and indexed.
+    AttachmentAdmitted { attachment: AttachmentMetadata },
     /// Supervisor registration and its raw one-time capability.
     SupervisorRegistered {
         /// New live Session identity.
@@ -388,6 +397,18 @@ impl Coordinator {
         match (actor, command) {
             (ActorContext::Bootstrap, CoordinatorCommand::RegisterSupervisor { definition }) => {
                 self.register_supervisor(definition).await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::AdmitAttachment {
+                    source,
+                    media_type,
+                    original_name,
+                },
+            ) => {
+                self.authenticate(&capability).await?;
+                self.admit_attachment(source, media_type, original_name)
+                    .await
             }
             (
                 ActorContext::Session { capability },
@@ -586,6 +607,51 @@ impl Coordinator {
     #[must_use]
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    async fn admit_attachment(
+        &self,
+        source: PathBuf,
+        media_type: String,
+        original_name: String,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if media_type.is_empty() || media_type.len() > 255 || media_type.contains(['\r', '\n']) {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "media type must contain 1 to 255 bytes without line breaks",
+            ));
+        }
+        if original_name.is_empty()
+            || original_name.len() > 255
+            || Path::new(&original_name)
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some(original_name.as_str())
+        {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "original name must be a basename containing 1 to 255 bytes",
+            ));
+        }
+        let attachment = AttachmentStore::new(&self.state_dir)
+            .admit(&source, &media_type, &original_name)
+            .await
+            .map_err(|error| {
+                CoordinatorError::new(ErrorCategory::InvalidInput, error.to_string())
+            })?;
+        let size = i64::try_from(attachment.size_bytes).map_err(CoordinatorError::storage)?;
+        sqlx::query("INSERT INTO attachments (id, digest, byte_size, media_type, original_name, storage_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .bind(attachment.id.to_string())
+            .bind(&attachment.digest)
+            .bind(size)
+            .bind(&attachment.media_type)
+            .bind(&attachment.original_name)
+            .bind(attachment.storage_path.to_string_lossy().as_ref())
+            .bind(timestamp())
+            .execute(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::AttachmentAdmitted { attachment })
     }
 
     async fn register_supervisor(
@@ -937,6 +1003,7 @@ impl Coordinator {
         })?;
         let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
         let now = timestamp();
+        require_attachments(&mut transaction, &submission.attachments).await?;
         let recipient_tier: Option<String> =
             sqlx::query_scalar("SELECT tier FROM harnesses WHERE id = ?")
                 .bind(submission.to.as_str())
@@ -1169,6 +1236,9 @@ impl Coordinator {
             ));
         }
         let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let mut attachment_ids = manifest.attachments.clone();
+        attachment_ids.extend(manifest.verification.iter().map(|entry| entry.evidence));
+        require_attachments(&mut transaction, &attachment_ids).await?;
         let task = sqlx::query("SELECT worker_id, state, result_revision FROM tasks WHERE id = ?")
             .bind(manifest.task_id.to_string())
             .fetch_optional(&mut *transaction)
@@ -1838,6 +1908,26 @@ async fn create_delivery_attempt(
         .execute(&mut **transaction)
         .await
         .map_err(CoordinatorError::storage)?;
+    Ok(())
+}
+
+async fn require_attachments(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attachments: &[crate::contract::AttachmentId],
+) -> Result<(), CoordinatorError> {
+    for attachment in attachments {
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attachments WHERE id = ?")
+            .bind(attachment.to_string())
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        if exists == 0 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::NotFound,
+                format!("Attachment {attachment} does not exist"),
+            ));
+        }
+    }
     Ok(())
 }
 
