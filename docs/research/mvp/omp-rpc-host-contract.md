@@ -106,6 +106,12 @@ A blocking Question normally ends or pauses the active OMP turn. When the Superv
 
 After Approval the Worker may remain idle and receive another top-level Task in the same OMP session only when the Task's Session reuse policy and candidate checks admit it; the coordination contract's Session reuse rules are authoritative. A failed, forcibly cancelled, or ambiguous session is stopped and cannot receive another Task.
 
+For a managed Supervisor Host reconnect, the adapter launches OMP with
+`--resume <durable-native-session-id>` and requires the first correlated
+`get_state` response to report that exact Session. Identity drift fails closed.
+This recovery resumes only the visible managed Supervisor conversation; a lost
+Worker Host does not automatically replay native work.
+
 ## Cancellation and shutdown
 
 Cancellation:

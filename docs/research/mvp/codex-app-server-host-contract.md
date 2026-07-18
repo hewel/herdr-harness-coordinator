@@ -47,6 +47,12 @@ Every request has a unique nonempty ID and a pending-request entry. Early notifi
 
 The Worker profile configures the local Coordinator MCP bridge. Its tools are identity-bound to this Harness Session. Missing required Coordinator tools fails Harness startup, while additional native tools and collaboration capabilities are allowed and recorded.
 
+After `thread/start` or `thread/resume`, the adapter calls
+`mcpServerStatus/list` when the installed App Server supports it and requires the
+tier-specific Herdr Coordinator tools. An explicit JSON-RPC method-not-found
+response is retained as older-server compatibility evidence; a supported method
+that omits required tools fails closed. Shell fallback is not production success.
+
 ## Delivery
 
 | Coordinator condition | App Server operation |
@@ -105,6 +111,12 @@ A blocking Question persists through the MCP bridge and moves the Task to `waiti
 After Approval, another Task may use the same thread sequentially only when the Task's Session reuse policy and candidate checks admit it; the coordination contract's Session reuse rules are authoritative. The Task attachment and message remain the authoritative bounded assignment even though the native thread retains history.
 
 The Coordinator does not automatically resume or adopt a thread after Worker Host loss. A deliberate Worker restart creates a new Harness Session and thread under the same durable Harness identity.
+
+A managed Codex Supervisor reconnect is narrower: it sends `thread/resume` with
+the exact durable thread ID and the selected cwd, model, approval policy, and
+sandbox policy. The returned thread must match exactly before event injection can
+resume. Unsettled Supervisor delivery remains `unknown` and is never replayed by
+the resumed thread without explicit reconciliation.
 
 ## Cancellation and shutdown
 

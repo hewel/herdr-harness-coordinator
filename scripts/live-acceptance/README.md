@@ -10,6 +10,36 @@ Herdr, OMP, Codex, SQLite, and authenticated provider installations.
 ./scripts/live-acceptance/capture-evidence.sh "$WORKSPACE_STATE_DIR"
 ```
 
+Crash and restart acceptance is deliberately destructive and runs only against an
+already prepared disposable live state root. Each phase has explicit process and
+durable-state prerequisites:
+
+```bash
+export LIVE_CRASH_ACCEPT=I_UNDERSTAND_THIS_SENDS_SIGNALS
+export LIVE_CANDIDATE_BIN=/absolute/path/to/tested/herdr-harness-coordinator
+export HERDR_WORKSPACE_ID=<workspace>
+export HERDR_SOCKET_PATH=<Herdr-session-socket>
+
+./scripts/live-acceptance/crash-recovery.sh "$WORKSPACE_STATE_DIR" controlled-restart
+
+export LIVE_SUPERVISOR_EVENT_ID=<dispatching-or-accepted-event>
+./scripts/live-acceptance/crash-recovery.sh "$WORKSPACE_STATE_DIR" supervisor-sigkill
+
+export LIVE_WORKER_ID=<worker>
+export LIVE_WORKER_SESSION_ID=<session-uuid>
+export LIVE_MUTATING_TASK_ID=<active-mutating-task-uuid>
+export LIVE_DOWNSTREAM_TASK_ID=<optional-dependent-task-uuid>
+./scripts/live-acceptance/crash-recovery.sh "$WORKSPACE_STATE_DIR" worker-sigkill
+```
+
+Run the phases on separate prepared state roots when their preconditions conflict.
+On every state root, run `controlled-restart` first so the later crash phases can
+prove that the live daemon is the tested candidate.
+The driver validates `/proc` executable, command-line, workspace, and Session
+identity before signaling; PID-file existence alone is never liveness authority.
+It captures durable and pane evidence at every boundary. It never reconciles an
+Unknown event, clears a Hold, approves a Task, or blindly replays ambiguous work.
+
 Use the identity-bound control helper during a live run instead of manually
 constructing MCP JSON-RPC frames. It discovers the immutable binary, Supervisor
 capability, and short broker socket from the workspace state directory:

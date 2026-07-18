@@ -396,7 +396,7 @@ pub enum SupervisorEventKind {
 }
 ```
 
-The durable-Inbox rule is exact: every Supervisor-attention fact persists as a Supervisor Event in the same transaction as its source fact, before any native injection. Events deduplicate on a unique source key, deliver oldest-first with at most one in flight, and record immutable attempts. `accepted` is provider acceptance, not model processing; `processed` is explicit Supervisor acknowledgement, which also marks the source inbox Message read. Ambiguous injection becomes `unknown` and settles only through explicit reconciliation with an audit note. Pending events survive every restart and are claimed after the next bind; nothing is replayed blindly.
+The durable-Inbox rule is exact: every Supervisor-attention fact persists as a Supervisor Event in the same transaction as its source fact, before any native injection. Events deduplicate on a unique source key, deliver oldest-first with at most one in flight, and record immutable attempts. Follow-up events are claimed only while the native Supervisor is idle, so a busy turn is never interrupted; progress-only adapter events never wake the model. `accepted` is provider acceptance, not model processing. Native turn-start and turn-completion observations are appended separately as visible-presentation evidence, while `processed` still requires explicit Supervisor acknowledgement and also marks the source inbox Message read. Ambiguous injection becomes `unknown` and settles only through an append-only reconciliation record with an audit note; reconciliation never rewrites the immutable event payload or acceptance evidence. Pending events survive every restart and are claimed after the next bind; nothing is replayed blindly.
 
 A self-registered unmanaged Supervisor keeps the pull model. A Worker Result becomes durable Supervisor inbox state plus Herdr metadata and popup notification; the Coordinator cannot inject a new turn into an already-running Supervisor process it does not own.
 
@@ -456,6 +456,7 @@ pub trait HarnessAdapter: Send {
     fn capabilities(&self) -> AdapterCapabilities;
 
     async fn start(&mut self, spec: &HarnessStartSpec) -> Result<NativeSession>;
+    async fn resume(&mut self, spec: &HarnessStartSpec, target: &NativeSessionResume) -> Result<NativeSession>;
     async fn dispatch(&mut self, delivery: ResolvedDelivery) -> Result<NativeAcceptance>;
     async fn cancel_active(&mut self) -> Result<()>;
     async fn stop(&mut self) -> Result<()>;
@@ -478,7 +479,9 @@ The integration persists live `terminal_id` separately from mutable `pane_id`, b
 
 One Coordinator daemon per `$HERDR_PLUGIN_STATE_DIR` owns SQLite and a local Unix socket. MCP stdio proxies, CLI commands, Supervisor registration, Worker Hosts, and the popup use the same command/query contract.
 
-Worker Hosts reconnect after a broker restart and replay sequenced host events from their retained buffer. A cold Herdr restart loses the original processes: active Sessions fail, pending mail remains, and any dispatched mutating Task enters Worktree Hold. The Coordinator never automatically adopts, resumes, or replays uncertain native work.
+Every pane-resident Host acquires a random, generation-fenced connection capability with a 15-second presence lease and renews it every two seconds. The daemon is the sole SQLite owner, reaps leases every second, and retries broker calls only when socket connection failed before any request bytes could be written. Write/read ambiguity is never replayed. PID files remain diagnostic and are not liveness authority.
+
+Worker Hosts reconnect across a bounded broker restart while their lease remains current and replay sequenced Host events only through the fenced connection. A stale Worker lease explicitly settles active work: dispatch ambiguity becomes `DeliveryUnknown`; working, waiting, or cancelling work fails; mutating work creates a Worktree Hold; and a Result already in `Reviewing` remains reviewable while its dead Session becomes ineligible for reuse. A stale managed Supervisor lease changes presence to `Disconnected`, preserves pending events, and makes unsettled injection `Unknown`. The daemon reopens the Supervisor pane and the adapter resumes only the exact durable OMP Session or Codex thread. It never adopts a different conversation or replays an Unknown event. A cold Worker restart still requires an explicit compatible Worker activation.
 
 Dependency edges, satisfied Result revisions, and frozen dependency inputs survive restart. The Coordinator reevaluates Blocked and Ready Tasks against durable state without duplicating dispatch. Delivery uncertainty and repository Holds continue to block inference or replay.
 
@@ -550,13 +553,14 @@ Codex native multi-agent behavior is permitted by the Worker profile and remains
 
 ### Compatibility
 
-Harness releases are not pinned. Each new Session resolves its selected executable, requires a successful bounded nonempty UTF-8 `--version` result, records the raw observed version, and then proves compatibility through the native handshake. OMP requires `ready`, correlated `set_host_tools`, and `get_state`; Codex requires `initialize`, `initialized`, and persistent thread creation. Missing semantics fail closed regardless of version text. A running Session retains its executable, profile snapshot and digest, model, and compatibility evidence; updates are observed only by a later Session and are never installed automatically.
+Harness releases are not pinned. Each new Session resolves its selected executable, requires a successful bounded nonempty UTF-8 `--version` result, records the raw observed version, and then proves compatibility through the native handshake. OMP requires `ready`, correlated `set_host_tools`, and `get_state`; Codex requires `initialize`, `initialized`, persistent thread start or exact thread resume, and—when supported—`mcpServerStatus/list` evidence that the tier-required Herdr tools are present. Missing semantics fail closed regardless of version text. A running Session retains its executable, profile snapshot and digest, model, and compatibility evidence; updates are observed only by a later Session and are never installed automatically.
 
 ## Herdr interface
 
 The plugin manifest declares:
 
 - a workspace-context `workspace` action for per-workspace setup and desired state;
+- a normal `supervisor` pane entrypoint that owns the managed visible Supervisor Host;
 - a normal `worker` pane entrypoint that owns the Harness Host and native process; and
 - a `harness-network` popup entrypoint that reads durable state and sends control commands.
 

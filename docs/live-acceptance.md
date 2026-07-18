@@ -48,6 +48,30 @@ Use `scripts/live-acceptance/capture-evidence.sh` for the durable projection. Co
 turn IDs are also present in its rollout JSONL. Herdr pane IDs come from
 `herdr pane list --workspace "$HERDR_WORKSPACE_ID"`.
 
+## Crash and restart recovery
+
+`scripts/live-acceptance/crash-recovery.sh` provides three opt-in phases:
+`controlled-restart`, `supervisor-sigkill`, and `worker-sigkill`. Prepare the
+durable state required by each phase first, then follow the environment contract in
+`scripts/live-acceptance/README.md`. Prefer separate disposable state roots so a
+deliberate crash in one scenario cannot invalidate another scenario's preconditions.
+Run the controlled restart on each root before a SIGKILL phase; the script refuses
+to crash a Host unless the live daemon executable is the selected tested candidate.
+
+The controlled phase compares immutable Task, dependency, and Result evidence,
+requires every pre-existing Session binding to survive, and rejects a new attempt
+for any previously unsettled Supervisor event across a verified daemon handoff. The
+Supervisor phase requires an event already in `dispatching` or
+`accepted`, proves the exact Host process before SIGKILL, rebinds a managed Host,
+and requires the unsettled event to become `unknown` without a new attempt. The
+Worker phase requires an active mutating Task, then requires explicit safe Task
+state, a Worktree Hold, Supervisor attention, blocked downstream work when supplied,
+and no additional dispatch transition before starting a replacement Worker.
+
+The script intentionally stops on the first missing invariant. An `unknown` event
+remains for explicit Supervisor inspection and reconciliation; the acceptance driver
+never chooses `retry`, `processed`, or `cancel` on the Supervisor's behalf.
+
 ## Current verified behavior
 
 The 2026-07-18 run proved both directions and Correction reuse against Herdr 0.7.4,
