@@ -362,6 +362,58 @@ async fn ambiguous_dispatch_requires_digest_confirmed_supervisor_reconciliation(
 }
 
 #[tokio::test]
+async fn inbox_and_popup_projections_follow_durable_read_markers() {
+    let (_state, coordinator, supervisor, worker, _task_id) = seeded_task().await;
+    let QueryResult::Inbox(messages) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorQuery::Inbox,
+        )
+        .await
+        .expect("Worker inbox query must succeed")
+    else {
+        panic!("inbox query must return Messages")
+    };
+    assert_eq!(messages.len(), 1);
+    let CommandOutcome::InboxMarkedRead { count } = coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::MarkInboxRead {
+                message_ids: vec![messages[0].id],
+            },
+        )
+        .await
+        .expect("recipient must mark its own Message")
+    else {
+        panic!("read command must report its count")
+    };
+    assert_eq!(count, 1);
+    let QueryResult::HarnessStatus(status) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::HarnessStatus,
+        )
+        .await
+        .expect("popup status query must succeed")
+    else {
+        panic!("status query must return Harness rows")
+    };
+    assert_eq!(status.len(), 2);
+    assert_eq!(
+        status
+            .iter()
+            .find(|row| row.id.as_str() == "omp-worker")
+            .expect("Worker row")
+            .unread_messages,
+        0
+    );
+}
+
+#[tokio::test]
 async fn supervisor_can_queue_a_mutating_task_for_an_explicit_worker() {
     let state = tempfile::tempdir().expect("state directory must exist");
     let coordinator = Coordinator::open(state.path())

@@ -8,6 +8,7 @@ use std::{
 use chrono::{SecondsFormat, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{
     Row, SqlitePool,
@@ -120,6 +121,8 @@ pub enum CoordinatorCommand {
         media_type: String,
         original_name: String,
     },
+    /// Mark admitted inbox Messages as observed by their recipient.
+    MarkInboxRead { message_ids: Vec<MessageId> },
     /// Register the sole Supervisor and create its live Session.
     RegisterSupervisor { definition: HarnessDefinitionV1 },
     /// Create or reactivate an explicit Worker Harness.
@@ -205,6 +208,14 @@ pub enum CoordinatorQuery {
         /// Task to retrieve.
         task_id: TaskId,
     },
+    /// Return all Tasks in durable FIFO order.
+    ListTasks,
+    /// Return unread Messages addressed to the authenticated Harness.
+    Inbox,
+    /// Return one row per durable Harness for popup presentation.
+    HarnessStatus,
+    /// Return unresolved Worktree Holds (Supervisor only).
+    ActiveHolds,
 }
 
 /// Durable Task lifecycle state.
@@ -286,12 +297,61 @@ pub struct TaskView {
     pub result_revision: u32,
 }
 
+/// Compact durable Harness and live Session projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessStatusView {
+    /// Durable Harness identity.
+    pub id: HarnessId,
+    /// Supervisor or Worker.
+    pub tier: HarnessTier,
+    /// Latest Session presence, or `offline` when no live Session exists.
+    pub presence: String,
+    /// Latest Session activity.
+    pub activity: String,
+    /// Unread durable Message count.
+    pub unread_messages: u32,
+    /// Current active Task, when one exists.
+    pub active_task_id: Option<TaskId>,
+}
+
+/// Durable inbox Message projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxMessageView {
+    /// Message identity.
+    pub id: MessageId,
+    /// Related Task, when present.
+    pub task_id: Option<TaskId>,
+    /// Authenticated sender identity.
+    pub sender_id: HarnessId,
+    /// Public or reserved Message kind.
+    pub kind: String,
+    /// Original versioned Message JSON.
+    pub body: Value,
+    /// Latest native delivery state, when delivery applies.
+    pub delivery_state: Option<String>,
+}
+
+/// Unresolved advisory Worktree Hold projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldView {
+    /// Hold identity.
+    pub id: WorktreeHoldId,
+    /// Canonical repository scheduling key.
+    pub repository_key: String,
+    /// Task responsible for the Hold.
+    pub task_id: TaskId,
+    /// Stable reason.
+    pub reason: String,
+}
+
 /// Successful command outcome.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandOutcome {
     /// File was copied, hashed, and indexed.
     AttachmentAdmitted { attachment: AttachmentMetadata },
+    /// Inbox read markers were persisted.
+    InboxMarkedRead { count: u32 },
     /// Supervisor registration and its raw one-time capability.
     SupervisorRegistered {
         /// New live Session identity.
@@ -344,6 +404,14 @@ pub enum QueryResult {
     Harnesses(Vec<HarnessId>),
     /// One durable Task.
     Task(TaskView),
+    /// Durable Tasks in FIFO order.
+    Tasks(Vec<TaskView>),
+    /// Unread inbox Messages.
+    Inbox(Vec<InboxMessageView>),
+    /// Popup-oriented Harness rows.
+    HarnessStatus(Vec<HarnessStatusView>),
+    /// Active advisory Holds.
+    Holds(Vec<HoldView>),
 }
 
 /// One Coordinator daemon's deep transactional state module.
@@ -409,6 +477,13 @@ impl Coordinator {
                 self.authenticate(&capability).await?;
                 self.admit_attachment(source, media_type, original_name)
                     .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::MarkInboxRead { message_ids },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.mark_inbox_read(&actor, message_ids).await
             }
             (
                 ActorContext::Session { capability },
@@ -561,7 +636,7 @@ impl Coordinator {
                 "a live Session capability is required",
             ));
         };
-        self.authenticate(&capability).await?;
+        let actor = self.authenticate(&capability).await?;
         match query {
             CoordinatorQuery::ListHarnesses => {
                 let rows = sqlx::query("SELECT id FROM harnesses ORDER BY created_at, id")
@@ -599,6 +674,13 @@ impl Coordinator {
                     state,
                     result_revision: u32::try_from(revision).map_err(CoordinatorError::storage)?,
                 }))
+            }
+            CoordinatorQuery::ListTasks => self.list_tasks().await,
+            CoordinatorQuery::Inbox => self.inbox(&actor).await,
+            CoordinatorQuery::HarnessStatus => self.harness_status().await,
+            CoordinatorQuery::ActiveHolds => {
+                self.require_supervisor(&actor)?;
+                self.active_holds().await
             }
         }
     }
@@ -652,6 +734,140 @@ impl Coordinator {
             .await
             .map_err(CoordinatorError::storage)?;
         Ok(CommandOutcome::AttachmentAdmitted { attachment })
+    }
+
+    async fn mark_inbox_read(
+        &self,
+        actor: &AuthenticatedActor,
+        message_ids: Vec<MessageId>,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if message_ids.len() > 256 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "at most 256 inbox Messages may be marked at once",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let mut count = 0_u32;
+        for message_id in message_ids {
+            let changed = sqlx::query("INSERT OR IGNORE INTO inbox_reads (harness_id, message_id, read_at) SELECT ?, id, ? FROM messages WHERE id = ? AND recipient_id = ?")
+                .bind(actor.id.as_str())
+                .bind(timestamp())
+                .bind(message_id.to_string())
+                .bind(actor.id.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?
+                .rows_affected();
+            count = count.saturating_add(u32::try_from(changed).unwrap_or(u32::MAX));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::InboxMarkedRead { count })
+    }
+
+    async fn list_tasks(&self) -> Result<QueryResult, CoordinatorError> {
+        let rows = sqlx::query(
+            "SELECT id, worker_id, state, result_revision FROM tasks ORDER BY created_sequence",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let tasks = rows
+            .iter()
+            .map(task_view_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(QueryResult::Tasks(tasks))
+    }
+
+    async fn inbox(&self, actor: &AuthenticatedActor) -> Result<QueryResult, CoordinatorError> {
+        let rows = sqlx::query(
+            "SELECT m.id, m.task_id, m.sender_id, m.kind, m.body_json, (SELECT state FROM delivery_attempts d WHERE d.message_id = m.id ORDER BY d.attempt_number DESC LIMIT 1) AS delivery_state FROM messages m LEFT JOIN inbox_reads r ON r.harness_id = ? AND r.message_id = m.id WHERE m.recipient_id = ? AND r.message_id IS NULL ORDER BY m.created_sequence",
+        )
+        .bind(actor.id.as_str())
+        .bind(actor.id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let messages = rows
+            .iter()
+            .map(|row| {
+                Ok(InboxMessageView {
+                    id: parse_uuid_id(row.get("id"))?,
+                    task_id: row
+                        .get::<Option<&str>, _>("task_id")
+                        .map(parse_uuid_id)
+                        .transpose()?,
+                    sender_id: HarnessId::from_str(row.get("sender_id"))
+                        .map_err(CoordinatorError::storage)?,
+                    kind: row.get::<&str, _>("kind").to_owned(),
+                    body: serde_json::from_str(row.get("body_json"))
+                        .map_err(CoordinatorError::storage)?,
+                    delivery_state: row
+                        .get::<Option<&str>, _>("delivery_state")
+                        .map(str::to_owned),
+                })
+            })
+            .collect::<Result<Vec<_>, CoordinatorError>>()?;
+        Ok(QueryResult::Inbox(messages))
+    }
+
+    async fn harness_status(&self) -> Result<QueryResult, CoordinatorError> {
+        let rows = sqlx::query(
+            "SELECT h.id, h.tier, COALESCE((SELECT presence FROM harness_sessions s WHERE s.harness_id = h.id AND s.ended_at IS NULL ORDER BY s.started_at DESC LIMIT 1), 'offline') AS presence, COALESCE((SELECT activity FROM harness_sessions s WHERE s.harness_id = h.id AND s.ended_at IS NULL ORDER BY s.started_at DESC LIMIT 1), 'idle') AS activity, (SELECT COUNT(*) FROM messages m LEFT JOIN inbox_reads r ON r.harness_id = h.id AND r.message_id = m.id WHERE m.recipient_id = h.id AND r.message_id IS NULL) AS unread_messages, (SELECT id FROM tasks t WHERE t.worker_id = h.id AND t.state IN ('dispatching','working','waiting','reviewing','cancelling','delivery_unknown') ORDER BY t.created_sequence LIMIT 1) AS active_task_id FROM harnesses h ORDER BY h.created_at, h.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let status = rows
+            .iter()
+            .map(|row| {
+                let tier = match row.get::<&str, _>("tier") {
+                    "supervisor" => HarnessTier::Supervisor,
+                    "worker" => HarnessTier::Worker,
+                    value => {
+                        return Err(CoordinatorError::new(
+                            ErrorCategory::StorageFailure,
+                            format!("unknown Harness tier `{value}`"),
+                        ));
+                    }
+                };
+                let unread: i64 = row.get("unread_messages");
+                Ok(HarnessStatusView {
+                    id: HarnessId::from_str(row.get("id")).map_err(CoordinatorError::storage)?,
+                    tier,
+                    presence: row.get::<&str, _>("presence").to_owned(),
+                    activity: row.get::<&str, _>("activity").to_owned(),
+                    unread_messages: u32::try_from(unread).map_err(CoordinatorError::storage)?,
+                    active_task_id: row
+                        .get::<Option<&str>, _>("active_task_id")
+                        .map(parse_uuid_id)
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>, CoordinatorError>>()?;
+        Ok(QueryResult::HarnessStatus(status))
+    }
+
+    async fn active_holds(&self) -> Result<QueryResult, CoordinatorError> {
+        let rows = sqlx::query("SELECT id, repository_key, task_id, reason FROM worktree_holds WHERE cleared_at IS NULL ORDER BY created_at")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let holds = rows
+            .iter()
+            .map(|row| {
+                Ok(HoldView {
+                    id: parse_uuid_id(row.get("id"))?,
+                    repository_key: row.get::<&str, _>("repository_key").to_owned(),
+                    task_id: parse_uuid_id(row.get("task_id"))?,
+                    reason: row.get::<&str, _>("reason").to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, CoordinatorError>>()?;
+        Ok(QueryResult::Holds(holds))
     }
 
     async fn register_supervisor(
@@ -2016,10 +2232,26 @@ impl UuidIdentity for TaskId {
     }
 }
 
+impl UuidIdentity for WorktreeHoldId {
+    fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
 fn parse_uuid_id<T: UuidIdentity>(value: &str) -> Result<T, CoordinatorError> {
     Uuid::parse_str(value)
         .map(T::from_uuid)
         .map_err(CoordinatorError::storage)
+}
+
+fn task_view_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TaskView, CoordinatorError> {
+    let revision: i64 = row.get("result_revision");
+    Ok(TaskView {
+        id: parse_uuid_id(row.get("id"))?,
+        worker_id: HarnessId::from_str(row.get("worker_id")).map_err(CoordinatorError::storage)?,
+        state: TaskState::from_str(row.get("state"))?,
+        result_revision: u32::try_from(revision).map_err(CoordinatorError::storage)?,
+    })
 }
 
 fn message_kind_name(kind: MessageKind) -> &'static str {
