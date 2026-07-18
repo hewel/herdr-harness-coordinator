@@ -15,6 +15,7 @@ use sqlx::{
 };
 use thiserror::Error;
 
+use crate::contract::{CodexApprovalPolicy, CodexSandboxMode};
 use crate::contract::{HarnessId, HarnessKind};
 
 const SCHEMA_VERSION: u32 = 1;
@@ -62,6 +63,12 @@ pub struct SupervisorSelection {
     pub model: String,
     /// Optional provider-native reasoning effort.
     pub reasoning_effort: Option<String>,
+    /// Explicit Codex App Server approval policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_approval_policy: Option<CodexApprovalPolicy>,
+    /// Explicit Codex App Server sandbox mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_sandbox_mode: Option<CodexSandboxMode>,
 }
 
 /// Exact durable Worker identity and launch profile selection.
@@ -557,6 +564,21 @@ fn validate_selection(selection: &WorkspaceSelection) -> Result<(), ActivationEr
     if selection.supervisor.model.trim().is_empty() {
         return Err(ActivationError::InvalidSelection(
             "Supervisor model is empty".to_owned(),
+        ));
+    }
+    let codex_policy_complete = selection.supervisor.codex_approval_policy.is_some()
+        && selection.supervisor.codex_sandbox_mode.is_some();
+    if selection.supervisor.kind == HarnessKind::Codex && !codex_policy_complete {
+        return Err(ActivationError::InvalidSelection(
+            "Codex Supervisor requires explicit approval and sandbox policies".to_owned(),
+        ));
+    }
+    if selection.supervisor.kind != HarnessKind::Codex
+        && (selection.supervisor.codex_approval_policy.is_some()
+            || selection.supervisor.codex_sandbox_mode.is_some())
+    {
+        return Err(ActivationError::InvalidSelection(
+            "Codex Supervisor policies require a Codex Supervisor".to_owned(),
         ));
     }
     if selection.workers.is_empty() {

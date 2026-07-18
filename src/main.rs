@@ -17,7 +17,10 @@ use herdr_harness_coordinator::{
         WorkspaceSelection,
     },
     broker::{BrokerRequest, BrokerServer, call},
-    contract::{HarnessDefinitionV1, HarnessId, HarnessKind, HarnessTier, SCHEMA_VERSION},
+    contract::{
+        CodexApprovalPolicy, CodexSandboxMode, HarnessDefinitionV1, HarnessId, HarnessKind,
+        HarnessTier, SCHEMA_VERSION,
+    },
     core::{
         ActorContext, CommandOutcome, Coordinator, CoordinatorCommand, CoordinatorQuery,
         HarnessStatusView, QueryResult, SessionCapability,
@@ -137,6 +140,12 @@ enum WorkspaceCommand {
         /// Provider-native Supervisor reasoning effort.
         #[arg(long)]
         supervisor_reasoning_effort: Option<String>,
+        /// Explicit Codex App Server approval policy.
+        #[arg(long)]
+        supervisor_codex_approval_policy: Option<String>,
+        /// Explicit Codex App Server sandbox mode.
+        #[arg(long)]
+        supervisor_codex_sandbox_mode: Option<String>,
         /// Explicit Worker mapping in `worker-id=profile-id` form.
         #[arg(long)]
         worker: Vec<String>,
@@ -284,6 +293,8 @@ async fn run_workspace(state_dir: PathBuf, command: WorkspaceCommand) -> Result<
             supervisor_kind,
             supervisor_model,
             supervisor_reasoning_effort,
+            supervisor_codex_approval_policy,
+            supervisor_codex_sandbox_mode,
             worker,
         } => {
             let identity = workspace_identity(&target)?;
@@ -291,6 +302,8 @@ async fn run_workspace(state_dir: PathBuf, command: WorkspaceCommand) -> Result<
                 supervisor_kind,
                 supervisor_model,
                 supervisor_reasoning_effort,
+                supervisor_codex_approval_policy,
+                supervisor_codex_sandbox_mode,
                 worker,
             )?;
             let desired = match state {
@@ -456,6 +469,18 @@ async fn activate_workspace(
             "HERDR_COORDINATOR_BIN".to_owned(),
             std::env::current_exe()?.to_string_lossy().into_owned(),
         );
+        if let Some(policy) = selection.supervisor.codex_approval_policy {
+            pane.env.insert(
+                "HERDR_CODEX_APPROVAL_POLICY".to_owned(),
+                codex_approval_policy_name(policy).to_owned(),
+            );
+        }
+        if let Some(mode) = selection.supervisor.codex_sandbox_mode {
+            pane.env.insert(
+                "HERDR_CODEX_SANDBOX_MODE".to_owned(),
+                codex_sandbox_mode_name(mode).to_owned(),
+            );
+        }
         HerdrSocketClient::new(identity.session_socket().to_path_buf())
             .open_worker(pane)
             .await
@@ -714,9 +739,17 @@ fn workspace_selection(
     kind: Option<HarnessKindArg>,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    codex_approval_policy: Option<String>,
+    codex_sandbox_mode: Option<String>,
     workers: Vec<String>,
 ) -> Result<Option<WorkspaceSelection>> {
-    if kind.is_none() && model.is_none() && workers.is_empty() && reasoning_effort.is_none() {
+    if kind.is_none()
+        && model.is_none()
+        && workers.is_empty()
+        && reasoning_effort.is_none()
+        && codex_approval_policy.is_none()
+        && codex_sandbox_mode.is_none()
+    {
         return Ok(None);
     }
     let kind = match kind.context("--supervisor-kind is required when changing selection")? {
@@ -724,6 +757,12 @@ fn workspace_selection(
         HarnessKindArg::Codex => HarnessKind::Codex,
     };
     let model = model.context("--supervisor-model is required when changing selection")?;
+    let codex_approval_policy = codex_approval_policy
+        .map(|value| parse_named_enum(&value, "--supervisor-codex-approval-policy"))
+        .transpose()?;
+    let codex_sandbox_mode = codex_sandbox_mode
+        .map(|value| parse_named_enum(&value, "--supervisor-codex-sandbox-mode"))
+        .transpose()?;
     let workers = workers
         .into_iter()
         .map(|mapping| {
@@ -742,9 +781,32 @@ fn workspace_selection(
             kind,
             model,
             reasoning_effort,
+            codex_approval_policy,
+            codex_sandbox_mode,
         },
         workers,
     }))
+}
+
+fn parse_named_enum<T: serde::de::DeserializeOwned>(value: &str, flag: &str) -> Result<T> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .with_context(|| format!("invalid value for {flag}"))
+}
+
+const fn codex_approval_policy_name(policy: CodexApprovalPolicy) -> &'static str {
+    match policy {
+        CodexApprovalPolicy::Untrusted => "untrusted",
+        CodexApprovalPolicy::OnRequest => "on-request",
+        CodexApprovalPolicy::Never => "never",
+    }
+}
+
+const fn codex_sandbox_mode_name(mode: CodexSandboxMode) -> &'static str {
+    match mode {
+        CodexSandboxMode::ReadOnly => "read-only",
+        CodexSandboxMode::WorkspaceWrite => "workspace-write",
+        CodexSandboxMode::DangerFullAccess => "danger-full-access",
+    }
 }
 
 fn print_activation(
@@ -837,10 +899,13 @@ async fn run_proxy(socket: PathBuf) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, WorkspaceCommand, WorkspaceStateArg, selected_workers_are_online};
+    use super::{
+        Cli, Command, HarnessKindArg, WorkspaceCommand, WorkspaceStateArg,
+        selected_workers_are_online, workspace_selection,
+    };
     use clap::Parser;
     use herdr_harness_coordinator::{
-        contract::{HarnessTier, TaskId},
+        contract::{CodexApprovalPolicy, CodexSandboxMode, HarnessTier, TaskId},
         core::HarnessStatusView,
     };
 
@@ -875,6 +940,29 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn codex_supervisor_policy_is_explicit_workspace_selection() {
+        let selection = workspace_selection(
+            Some(HarnessKindArg::Codex),
+            Some("gpt-5.6-sol".to_owned()),
+            None,
+            Some("never".to_owned()),
+            Some("danger-full-access".to_owned()),
+            vec!["worker=omp-kimi".to_owned()],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            selection.supervisor.codex_approval_policy,
+            Some(CodexApprovalPolicy::Never)
+        );
+        assert_eq!(
+            selection.supervisor.codex_sandbox_mode,
+            Some(CodexSandboxMode::DangerFullAccess)
+        );
     }
 
     #[test]

@@ -335,10 +335,7 @@ impl HarnessAdapter for OmpProcessAdapter {
             session_id: field(&value, "sessionId"),
             thread_id: None,
             cwd: spec.cwd.clone(),
-            // The CLI accepts the exact selected model before RPC startup, while
-            // `get_state` may report a provider-local alias (for example `k3`).
-            // Preserve the immutable launch selection for reuse compatibility.
-            model: spec.model.clone().or_else(|| model(&value)),
+            model: compatible_omp_model(spec.model.as_deref(), model(&value)),
         };
         {
             let mut state = self.0.state.lock().await;
@@ -447,6 +444,29 @@ impl HarnessAdapter for OmpProcessAdapter {
     fn events(&mut self) -> AdapterEventStream {
         self.0.events()
     }
+}
+
+fn compatible_omp_model(selected: Option<&str>, observed: Option<String>) -> Option<String> {
+    match (selected, observed) {
+        (Some(selected), Some(observed))
+            if selected == observed || selected_omp_alias(selected) == observed =>
+        {
+            Some(selected.to_owned())
+        }
+        (_, Some(observed)) => Some(observed),
+        (Some(selected), None) => Some(selected.to_owned()),
+        (None, None) => None,
+    }
+}
+
+fn selected_omp_alias(model: &str) -> &str {
+    model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .split(':')
+        .next()
+        .unwrap_or(model)
 }
 
 #[async_trait]
@@ -1145,5 +1165,30 @@ fn delivery_ambiguous(kind: HarnessKind, message: impl Into<String>) -> AdapterE
     AdapterError::DeliveryAmbiguous {
         kind,
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::compatible_omp_model;
+
+    #[test]
+    fn verified_omp_alias_retains_the_explicit_selection() {
+        assert_eq!(
+            compatible_omp_model(Some("kimi-code/k3:high"), Some("k3".to_owned())).as_deref(),
+            Some("kimi-code/k3:high")
+        );
+    }
+
+    #[test]
+    fn different_provider_model_is_not_recorded_as_the_selection() {
+        assert_eq!(
+            compatible_omp_model(
+                Some("kimi-code/k3:high"),
+                Some("different-model".to_owned())
+            )
+            .as_deref(),
+            Some("different-model")
+        );
     }
 }

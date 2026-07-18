@@ -68,7 +68,7 @@ while IFS= read -r line; do
       ;;
     *'"type":"get_state"'*)
       id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-      printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"sessionId":"omp-session","isStreaming":false,"queuedMessageCount":0,"model":{"id":"provider-model-alias"}}}\n' "$id"
+      printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"sessionId":"omp-session","isStreaming":false,"queuedMessageCount":0,"model":{"id":"k3"}}}\n' "$id"
       ;;
     *'"type":"prompt"'*)
       id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
@@ -80,6 +80,8 @@ while IFS= read -r line; do
 done
 "#,
     );
+    let mut start_spec = spec(&temp, provider);
+    start_spec.model = Some("kimi-code/k3:high".to_owned());
     let mut adapter = OmpProcessAdapter::new().with_timeouts(
         Duration::from_secs(2),
         Duration::from_secs(2),
@@ -87,10 +89,7 @@ done
     );
     let mut events = adapter.events();
 
-    let native = adapter
-        .start(&spec(&temp, provider))
-        .await
-        .expect("start OMP");
+    let native = adapter.start(&start_spec).await.expect("start OMP");
     let acceptance = adapter
         .dispatch(delivery(NativeDeliveryKind::StartTurn))
         .await
@@ -98,7 +97,7 @@ done
 
     assert_eq!(native.session_id.as_deref(), Some("omp-session"));
     assert_eq!(native.observed_version, "omp/17.0.4");
-    assert_eq!(native.model.as_deref(), Some("fixture-model"));
+    assert_eq!(native.model.as_deref(), Some("kimi-code/k3:high"));
     assert_eq!(acceptance.correlation, "delivery-7");
     let mut completed = false;
     for _ in 0..4 {

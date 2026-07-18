@@ -368,6 +368,8 @@ pub struct SupervisorBindSpec {
     pub model: Option<String>,
     pub provider_profile: Option<String>,
     pub config_overlays: Vec<PathBuf>,
+    pub codex_approval_policy: Option<CodexApprovalPolicy>,
+    pub codex_sandbox_mode: Option<CodexSandboxMode>,
     pub environment: BTreeMap<String, String>,
 }
 

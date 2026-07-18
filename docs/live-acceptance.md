@@ -24,6 +24,9 @@ herdr plugin pane open --plugin herdr-harness-coordinator --entrypoint harness-n
 ```
 
 The `supervisor` and `worker` pane entrypoints are opened by `workspace set on`.
+Codex Supervisors additionally require explicit
+`--supervisor-codex-approval-policy` and `--supervisor-codex-sandbox-mode`
+arguments; the live script visibly opts into `never` and `danger-full-access`.
 Herdr owns `HERDR_PLUGIN_STATE_DIR`; spawned panes receive the per-workspace
 Coordinator root as `HERDR_COORDINATOR_STATE_DIR`. They also require
 `HERDR_SOCKET_PATH` and their identity capability. Worker panes additionally receive

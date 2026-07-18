@@ -89,6 +89,14 @@ pub async fn run_managed_supervisor_host(
             model: session.definition.model.clone(),
             provider_profile: None,
             config_overlays: Vec::new(),
+            codex_approval_policy: environment
+                .get("HERDR_CODEX_APPROVAL_POLICY")
+                .map(|value| parse_codex_policy(value))
+                .transpose()?,
+            codex_sandbox_mode: environment
+                .get("HERDR_CODEX_SANDBOX_MODE")
+                .map(|value| parse_codex_sandbox(value))
+                .transpose()?,
             environment,
         })
         .await
@@ -472,10 +480,8 @@ impl SupervisorAdapter for ProcessSupervisorAdapter {
                 provider_profile: spec.provider_profile.clone(),
                 model: spec.model.clone(),
                 config_overlays: spec.config_overlays.clone(),
-                codex_approval_policy: (self.adapter.kind() == HarnessKind::Codex)
-                    .then_some(crate::contract::CodexApprovalPolicy::Never),
-                codex_sandbox_mode: (self.adapter.kind() == HarnessKind::Codex)
-                    .then_some(crate::contract::CodexSandboxMode::DangerFullAccess),
+                codex_approval_policy: spec.codex_approval_policy,
+                codex_sandbox_mode: spec.codex_sandbox_mode,
                 environment: spec.environment.clone(),
             })
             .await?;
@@ -546,6 +552,16 @@ impl SupervisorAdapter for ProcessSupervisorAdapter {
         });
         Box::pin(stream::select(events, stream::empty()))
     }
+}
+
+fn parse_codex_policy(value: &str) -> Result<crate::contract::CodexApprovalPolicy> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .context("invalid explicit Codex Supervisor approval policy")
+}
+
+fn parse_codex_sandbox(value: &str) -> Result<crate::contract::CodexSandboxMode> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .context("invalid explicit Codex Supervisor sandbox mode")
 }
 
 fn compact_payload(event: &SupervisorEvent) -> String {

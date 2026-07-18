@@ -5,7 +5,7 @@ use herdr_harness_coordinator::{
         ActivationRegistry, DesiredActivation, SetActivationRequest, SupervisorSelection,
         WorkerSelection, WorkspaceIdentity, WorkspaceSelection,
     },
-    contract::{HarnessId, HarnessKind},
+    contract::{CodexApprovalPolicy, CodexSandboxMode, HarnessId, HarnessKind},
 };
 
 fn identity(root: &std::path::Path, workspace_id: &str) -> WorkspaceIdentity {
@@ -23,6 +23,8 @@ fn selection() -> WorkspaceSelection {
             kind: HarnessKind::Codex,
             model: "gpt-5.6-sol".to_owned(),
             reasoning_effort: Some("high".to_owned()),
+            codex_approval_policy: Some(CodexApprovalPolicy::Never),
+            codex_sandbox_mode: Some(CodexSandboxMode::DangerFullAccess),
         },
         workers: vec![WorkerSelection {
             worker_id: "implementer".parse::<HarnessId>().unwrap(),

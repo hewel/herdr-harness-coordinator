@@ -15,8 +15,15 @@ session_socket=${HERDR_SOCKET_PATH:?run inside Herdr or export HERDR_SOCKET_PATH
 state_root=$(mktemp -d "${TMPDIR:-/tmp}/herdr-harness-live.XXXXXX")
 
 case "$supervisor_kind" in
-  omp) supervisor_model=${OMP_SUPERVISOR_MODEL:-kimi-code/k3:high} ;;
-  codex) supervisor_model=${CODEX_SUPERVISOR_MODEL:-gpt-5.6-sol} ;;
+  omp)
+    supervisor_model=${OMP_SUPERVISOR_MODEL:-kimi-code/k3:high}
+    set --
+    ;;
+  codex)
+    supervisor_model=${CODEX_SUPERVISOR_MODEL:-gpt-5.6-sol}
+    set -- --supervisor-codex-approval-policy never \
+      --supervisor-codex-sandbox-mode danger-full-access
+    ;;
   *) echo "unsupported Supervisor kind: $supervisor_kind" >&2; exit 2 ;;
 esac
 
@@ -26,6 +33,7 @@ herdr-harness-coordinator workspace --state-dir "$state_root" set on \
   --session-socket "$session_socket" \
   --supervisor-kind "$supervisor_kind" \
   --supervisor-model "$supervisor_model" \
+  "$@" \
   --worker "$worker_id=$profile_id" \
   --json
 
