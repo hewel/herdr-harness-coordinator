@@ -15,8 +15,8 @@ use crate::{
         ResultManifestV1, SCHEMA_VERSION, SupervisorEventId, TaskId,
     },
     core::{
-        ActorContext, CoordinatorCommand, CoordinatorQuery, SessionCapability,
-        SupervisorEventResolution,
+        ActorContext, CoordinatorCommand, CoordinatorQuery, HostConnectionCapability,
+        SessionCapability, SupervisorEventResolution,
     },
     herdr::{HerdrSocketClient, PluginPaneOpenParams},
     profile::ProfileRegistry,
@@ -38,7 +38,7 @@ const REQUIRED_WORKER_TOOLS: [&str; 7] = [
 #[derive(Debug, Clone)]
 pub struct McpServer {
     socket: PathBuf,
-    capability: SessionCapability,
+    actor: ActorContext,
     workspace_state_dir: Option<PathBuf>,
     herdr_socket: Option<PathBuf>,
     native_turn_id: Option<String>,
@@ -50,7 +50,7 @@ impl McpServer {
     pub fn new(socket: PathBuf, capability: SessionCapability) -> Self {
         Self {
             socket,
-            capability,
+            actor: ActorContext::Session { capability },
             workspace_state_dir: None,
             herdr_socket: None,
             native_turn_id: None,
@@ -66,8 +66,24 @@ impl McpServer {
     ) -> Self {
         Self {
             socket,
-            capability,
+            actor: ActorContext::Session { capability },
             workspace_state_dir: Some(workspace_state_dir),
+            herdr_socket: None,
+            native_turn_id: None,
+        }
+    }
+
+    /// Creates a bridge fenced to one current Host connection generation.
+    #[must_use]
+    pub fn for_host(
+        socket: PathBuf,
+        capability: HostConnectionCapability,
+        workspace_state_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            socket,
+            actor: ActorContext::Host { capability },
+            workspace_state_dir,
             herdr_socket: None,
             native_turn_id: None,
         }
@@ -270,15 +286,11 @@ impl McpServer {
                 request_id: uuid::Uuid::now_v7().to_string(),
                 operation: match operation {
                     ToolOperation::Execute(command) => BrokerOperation::Execute {
-                        actor: ActorContext::Session {
-                            capability: self.capability.clone(),
-                        },
+                        actor: self.actor.clone(),
                         command,
                     },
                     ToolOperation::Query(query) => BrokerOperation::Query {
-                        actor: ActorContext::Session {
-                            capability: self.capability.clone(),
-                        },
+                        actor: self.actor.clone(),
                         query,
                     },
                 },
@@ -316,9 +328,7 @@ impl McpServer {
                 schema_version: SCHEMA_VERSION,
                 request_id: uuid::Uuid::now_v7().to_string(),
                 operation: BrokerOperation::Execute {
-                    actor: ActorContext::Session {
-                        capability: self.capability.clone(),
-                    },
+                    actor: self.actor.clone(),
                     command: CoordinatorCommand::AdmitAttachment {
                         source: temporary.clone(),
                         media_type: args.media_type,
@@ -356,9 +366,7 @@ impl McpServer {
             schema_version: SCHEMA_VERSION,
             request_id: uuid::Uuid::now_v7().to_string(),
             operation: BrokerOperation::Execute {
-                actor: ActorContext::Session {
-                    capability: self.capability.clone(),
-                },
+                actor: self.actor.clone(),
                 command: CoordinatorCommand::StartWorker {
                     definition: definition.clone(),
                     profile_snapshot,
@@ -415,9 +423,7 @@ impl McpServer {
                     schema_version: SCHEMA_VERSION,
                     request_id: uuid::Uuid::now_v7().to_string(),
                     operation: BrokerOperation::Execute {
-                        actor: ActorContext::Session {
-                            capability: self.capability.clone(),
-                        },
+                        actor: self.actor.clone(),
                         command: CoordinatorCommand::AbortWorkerStart {
                             worker_id: worker_id.clone(),
                             diagnostic: error.to_string(),
@@ -822,6 +828,19 @@ pub fn from_bearer(socket: &Path, bearer: String) -> Result<McpServer> {
     ))
 }
 
+/// Creates a provider bridge fenced to a current Host connection generation.
+///
+/// # Errors
+///
+/// Returns an error when the bearer is not a valid Host connection capability.
+pub fn from_host_bearer(socket: &Path, bearer: String) -> Result<McpServer> {
+    Ok(McpServer::for_host(
+        socket.to_path_buf(),
+        HostConnectionCapability::from_bearer(bearer)?,
+        None,
+    ))
+}
+
 /// Convenience constructor for short runtime sockets outside the durable state directory.
 ///
 /// # Errors
@@ -836,5 +855,22 @@ pub fn from_bearer_for_workspace(
         socket.to_path_buf(),
         SessionCapability::from_bearer(bearer)?,
         workspace_state_dir,
+    ))
+}
+
+/// Creates a workspace-aware provider bridge fenced to one Host generation.
+///
+/// # Errors
+///
+/// Returns an error when the bearer is not a valid Host connection capability.
+pub fn from_host_bearer_for_workspace(
+    socket: &Path,
+    bearer: String,
+    workspace_state_dir: PathBuf,
+) -> Result<McpServer> {
+    Ok(McpServer::for_host(
+        socket.to_path_buf(),
+        HostConnectionCapability::from_bearer(bearer)?,
+        Some(workspace_state_dir),
     ))
 }

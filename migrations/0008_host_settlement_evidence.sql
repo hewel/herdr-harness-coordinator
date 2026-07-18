@@ -1,0 +1,2 @@
+ALTER TABLE supervisor_event_attempts
+ADD COLUMN ambiguity_evidence_json TEXT;

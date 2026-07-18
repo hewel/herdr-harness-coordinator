@@ -8,6 +8,7 @@ pub mod contract;
 pub mod core;
 pub mod herdr;
 pub mod host;
+mod host_presence;
 pub mod mcp;
 pub mod process_adapter;
 pub mod profile;

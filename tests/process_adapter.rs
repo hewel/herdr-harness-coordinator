@@ -38,6 +38,7 @@ while IFS= read -r line; do
   case "$line" in
     *'"type":"set_host_tools"'*) printf '{"type":"response","id":"%s","command":"set_host_tools","success":true,"data":{}}\n' "$id" ;;
     *'"type":"get_state"'*) printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"sessionId":"omp-existing","isStreaming":false,"queuedMessageCount":0,"model":{"id":"fixture-model"}}}\n' "$id" ;;
+    *'"type":"get_messages"'*) printf '{"type":"response","id":"%s","command":"get_messages","success":true,"data":{"messages":[{"role":"user","content":"Coordinator Event ID event-visible"}]}}\n' "$id" ;;
   esac
 done
 "#,
@@ -73,6 +74,12 @@ done
             .windows(2)
             .any(|pair| pair == ["--resume", "omp-existing"]),
         "OMP must receive the exact durable Session ID: {arguments}"
+    );
+    assert!(
+        adapter
+            .conversation_contains("event-visible")
+            .await
+            .expect("read OMP conversation")
     );
     adapter.stop().await.expect("clean OMP shutdown");
 }
@@ -273,6 +280,7 @@ while IFS= read -r line; do
     *'"method":"thread/start"'*) printf '{"id":"%s","error":{"code":-32600,"message":"fresh start is forbidden during resume"}}\n' "$id" ;;
     *'"method":"thread/resume"'*) printf '{"id":"%s","result":{"thread":{"id":"thread-existing"},"cwd":"%s","model":"fixture-model"}}\n' "$id" "$PWD" ;;
     *'"method":"mcpServerStatus/list"'*) printf '{"id":"%s","result":{"data":[{"name":"herdr","serverInfo":null,"tools":{"harness_list":{},"harness_status":{},"harness_inbox":{},"harness_request":{},"harness_send":{},"harness_complete":{},"harness_attachment_create":{}},"resources":[],"resourceTemplates":[],"authStatus":"notLoginRequired"}],"nextCursor":null}}\n' "$id" ;;
+    *'"method":"thread/read"'*) printf '{"id":"%s","result":{"thread":{"id":"thread-existing","turns":[{"items":[{"type":"userMessage","text":"Coordinator Event ID event-visible"}]}]}}}\n' "$id" ;;
   esac
 done
 "#,
@@ -304,6 +312,12 @@ done
     assert!(methods.contains("thread/resume"));
     assert!(methods.contains("mcpServerStatus/list"));
     assert!(!methods.contains("thread/start"));
+    assert!(
+        adapter
+            .conversation_contains("event-visible")
+            .await
+            .expect("read Codex conversation")
+    );
     adapter.stop().await.expect("clean Codex shutdown");
 }
 

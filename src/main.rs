@@ -254,13 +254,20 @@ async fn main() -> Result<()> {
             socket,
         } => {
             let socket = socket.unwrap_or_else(|| state_dir.join("coordinator.sock"));
-            herdr_harness_coordinator::mcp::from_bearer_for_workspace(
-                &socket,
-                session_capability,
-                state_dir,
-            )?
-            .run_stdio()
-            .await
+            let server = if std::env::var("HERDR_HARNESS_ACTOR").as_deref() == Ok("host") {
+                herdr_harness_coordinator::mcp::from_host_bearer_for_workspace(
+                    &socket,
+                    session_capability,
+                    state_dir,
+                )?
+            } else {
+                herdr_harness_coordinator::mcp::from_bearer_for_workspace(
+                    &socket,
+                    session_capability,
+                    state_dir,
+                )?
+            };
+            server.run_stdio().await
         }
     }
 }
@@ -926,6 +933,18 @@ async fn reopen_disconnected_supervisor(
     )?;
     let bearer = tokio::fs::read_to_string(&capability_path).await?;
     let capability = SessionCapability::from_bearer(bearer.trim().to_owned())?;
+    let CommandOutcome::SupervisorReconnectPrepared { claimed } = coordinator
+        .execute(
+            ActorContext::Bootstrap,
+            CoordinatorCommand::PrepareSupervisorReconnect,
+        )
+        .await?
+    else {
+        bail!("Coordinator returned the wrong Supervisor reconnect outcome")
+    };
+    if !claimed {
+        return Ok(false);
+    }
     let QueryResult::Session(session) = coordinator
         .query(
             ActorContext::Session {
@@ -937,9 +956,7 @@ async fn reopen_disconnected_supervisor(
     else {
         bail!("Coordinator returned the wrong Supervisor Session projection")
     };
-    if session.presence != "disconnected" {
-        return Ok(false);
-    }
+    debug_assert_eq!(session.presence, "reconnecting");
     let bearer = serde_json::to_value(&capability)?
         .as_str()
         .context("Supervisor capability did not serialize as text")?

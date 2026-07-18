@@ -2148,6 +2148,24 @@ async fn replacement_host_connection_fences_the_previous_generation() {
     };
 
     assert_eq!(second_generation, first_generation + 1);
+    let retagged = SessionCapability::from_bearer(
+        serde_json::to_value(&second)
+            .expect("Host capability serializes")
+            .as_str()
+            .expect("Host capability is a bearer")
+            .to_owned(),
+    )
+    .expect("bearer shapes deliberately match");
+    let error = coordinator
+        .query(
+            ActorContext::Session {
+                capability: retagged,
+            },
+            CoordinatorQuery::SessionSelf,
+        )
+        .await
+        .expect_err("retagging a Host bearer must not bypass the Host actor boundary");
+    assert_eq!(error.category, ErrorCategory::Unauthenticated);
     let error = coordinator
         .query(
             ActorContext::Host { capability: first },
@@ -2254,6 +2272,422 @@ async fn stale_supervisor_presence_lease_becomes_disconnected() {
         panic!("query must return the Supervisor Session")
     };
     assert_eq!(session.presence, "disconnected");
+}
+
+#[tokio::test]
+async fn interrupted_host_expiry_is_resumed_and_settled_once() {
+    let state = tempfile::tempdir().expect("state directory must exist");
+    let coordinator = Coordinator::open(state.path())
+        .await
+        .expect("Coordinator must open");
+    let CommandOutcome::SupervisorRegistered { capability, .. } = coordinator
+        .execute(
+            ActorContext::Bootstrap,
+            CoordinatorCommand::RegisterSupervisor {
+                definition: HarnessDefinitionV1 {
+                    schema_version: SCHEMA_VERSION,
+                    id: "supervisor".parse().expect("Harness ID"),
+                    kind: HarnessKind::Codex,
+                    tier: HarnessTier::Supervisor,
+                    cwd: state.path().to_path_buf(),
+                    launch_profile: None,
+                    model: None,
+                },
+            },
+        )
+        .await
+        .expect("Supervisor must register")
+    else {
+        panic!("registration must return a capability")
+    };
+    let CommandOutcome::HostConnectionBound { connection_id, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: capability.clone(),
+            },
+            CoordinatorCommand::BindHostConnection {
+                instance_id: "interrupted-supervisor-host".to_owned(),
+                lease_seconds: 15,
+            },
+        )
+        .await
+        .expect("Supervisor Host must bind")
+    else {
+        panic!("Host bind must return its identity")
+    };
+
+    let database = state.path().join("coordinator.sqlite3");
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", database.display()))
+        .await
+        .expect("test must reopen durable state");
+    sqlx::query("UPDATE host_connections SET status = 'disconnected', disconnect_reason = 'presence lease expired; settlement pending' WHERE id = ?")
+        .bind(connection_id)
+        .execute(&pool)
+        .await
+        .expect("test must simulate termination after the expiry claim");
+    pool.close().await;
+
+    assert!(matches!(
+        coordinator
+            .execute(
+                ActorContext::Bootstrap,
+                CoordinatorCommand::ReapStaleHostConnections,
+            )
+            .await
+            .expect("the next daemon must resume expiry settlement"),
+        CommandOutcome::StaleHostConnectionsReaped { count: 1 }
+    ));
+    let QueryResult::Session(session) = coordinator
+        .query(
+            ActorContext::Session { capability },
+            CoordinatorQuery::SessionSelf,
+        )
+        .await
+        .expect("the durable Supervisor Session remains queryable")
+    else {
+        panic!("query must return the Supervisor Session")
+    };
+    assert_eq!(session.presence, "disconnected");
+    assert!(matches!(
+        coordinator
+            .execute(
+                ActorContext::Bootstrap,
+                CoordinatorCommand::ReapStaleHostConnections,
+            )
+            .await
+            .expect("settled expiry must be idempotent"),
+        CommandOutcome::StaleHostConnectionsReaped { count: 0 }
+    ));
+}
+
+#[tokio::test]
+async fn state_migrated_through_committed_v7_upgrades_without_checksum_drift() {
+    let state = tempfile::tempdir().expect("state directory must exist");
+    let old_migrations = state.path().join("v7-migrations");
+    std::fs::create_dir(&old_migrations).expect("old migration directory");
+    let migration_source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let committed_v7 =
+        std::fs::read(migration_source.join("0007_host_recovery_and_presentation.sql"))
+            .expect("committed v7 migration");
+    assert_eq!(
+        hex::encode(Sha256::digest(&committed_v7)),
+        "31c4a03aadae237b14b381a6c5ebb683b736d716dd02fe546cd30afc1c17b60a",
+        "migration 0007 is immutable after ff45730"
+    );
+    for version in 1..=7 {
+        let prefix = format!("{version:04}_");
+        let source = std::fs::read_dir(&migration_source)
+            .expect("migration directory")
+            .map(|entry| entry.expect("migration entry").path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .expect("committed migration version");
+        std::fs::copy(
+            &source,
+            old_migrations.join(source.file_name().expect("migration filename")),
+        )
+        .expect("copy old migration");
+    }
+    let database = state.path().join("coordinator.sqlite3");
+    std::fs::File::create(&database).expect("database file");
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", database.display()))
+        .await
+        .expect("old database opens");
+    sqlx::migrate::Migrator::new(old_migrations)
+        .await
+        .expect("v7 migrator loads")
+        .run(&pool)
+        .await
+        .expect("state migrates through committed v7");
+    pool.close().await;
+
+    let coordinator = Coordinator::open(state.path())
+        .await
+        .expect("current Coordinator must apply only later migrations");
+    drop(coordinator);
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", database.display()))
+        .await
+        .expect("upgraded database opens");
+    let ambiguity_column: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('supervisor_event_attempts') WHERE name = 'ambiguity_evidence_json'")
+        .fetch_one(&pool)
+        .await
+        .expect("schema inspection succeeds");
+    assert_eq!(ambiguity_column, 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn supervisor_reconnect_claim_prevents_duplicate_pane_creation() {
+    let state = tempfile::tempdir().expect("state directory must exist");
+    let coordinator = Coordinator::open(state.path())
+        .await
+        .expect("Coordinator must open");
+    let CommandOutcome::SupervisorRegistered { capability, .. } = coordinator
+        .execute(
+            ActorContext::Bootstrap,
+            CoordinatorCommand::RegisterSupervisor {
+                definition: HarnessDefinitionV1 {
+                    schema_version: SCHEMA_VERSION,
+                    id: "supervisor".parse().expect("Harness ID"),
+                    kind: HarnessKind::Omp,
+                    tier: HarnessTier::Supervisor,
+                    cwd: state.path().to_path_buf(),
+                    launch_profile: None,
+                    model: None,
+                },
+            },
+        )
+        .await
+        .expect("Supervisor must register")
+    else {
+        panic!("registration must return a capability")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session { capability },
+            CoordinatorCommand::RecordSupervisorDisconnected {
+                diagnostic: Some("pane terminated".to_owned()),
+            },
+        )
+        .await
+        .expect("Supervisor disconnection must persist");
+
+    assert!(matches!(
+        coordinator
+            .execute(
+                ActorContext::Bootstrap,
+                CoordinatorCommand::PrepareSupervisorReconnect,
+            )
+            .await
+            .expect("first daemon must acquire the reconnect claim"),
+        CommandOutcome::SupervisorReconnectPrepared { claimed: true }
+    ));
+    assert!(matches!(
+        coordinator
+            .execute(
+                ActorContext::Bootstrap,
+                CoordinatorCommand::PrepareSupervisorReconnect,
+            )
+            .await
+            .expect("second daemon must observe the durable claim"),
+        CommandOutcome::SupervisorReconnectPrepared { claimed: false }
+    ));
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one regression proves immutable evidence across an Unknown reconciliation retry"
+)]
+async fn supervisor_ambiguity_preserves_acceptance_and_retry_presentation_evidence() {
+    let (state, coordinator, supervisor, worker, task_id) = seeded_task().await;
+    let CommandOutcome::TaskDispatching { message_id, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::DispatchTask { task_id },
+        )
+        .await
+        .expect("Task dispatches")
+    else {
+        panic!("dispatch returns Message identity")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::AcceptDelivery {
+                message_id,
+                native_correlation: "worker-turn".to_owned(),
+            },
+        )
+        .await
+        .expect("Worker accepts Task");
+    coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::SendMessage {
+                submission: message(
+                    "supervisor",
+                    task_id,
+                    MessageKind::Question,
+                    "Review attention",
+                    None,
+                ),
+            },
+        )
+        .await
+        .expect("attention event persists");
+    let CommandOutcome::HostConnectionBound {
+        capability: host, ..
+    } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::BindHostConnection {
+                instance_id: "supervisor-ambiguity-test".to_owned(),
+                lease_seconds: 15,
+            },
+        )
+        .await
+        .expect("Supervisor Host binds")
+    else {
+        panic!("Host bind returns capability")
+    };
+    let CommandOutcome::SupervisorEventClaimed { event: Some(event) } = coordinator
+        .execute(
+            ActorContext::Host {
+                capability: host.clone(),
+            },
+            CoordinatorCommand::ClaimNextSupervisorEvent,
+        )
+        .await
+        .expect("event claims")
+    else {
+        panic!("claim returns event")
+    };
+    coordinator
+        .execute(
+            ActorContext::Host {
+                capability: host.clone(),
+            },
+            CoordinatorCommand::AcceptSupervisorEvent {
+                event_id: event.id,
+                native_correlation: "first-correlation".to_owned(),
+                native_turn_id: None,
+                evidence: "immutable first acceptance".to_owned(),
+            },
+        )
+        .await
+        .expect("first attempt accepted");
+    coordinator
+        .execute(
+            ActorContext::Host {
+                capability: host.clone(),
+            },
+            CoordinatorCommand::RecordSupervisorEventPresentation {
+                event_id: event.id,
+                phase: herdr_harness_coordinator::core::SupervisorPresentationPhase::TurnStarted,
+                native_turn_id: None,
+                evidence: "first turn started without visible marker proof".to_owned(),
+            },
+        )
+        .await
+        .expect("first presentation persists");
+    coordinator
+        .execute(
+            ActorContext::Host {
+                capability: host.clone(),
+            },
+            CoordinatorCommand::MarkSupervisorEventUnknown {
+                event_id: event.id,
+                diagnostic: "visibility became ambiguous".to_owned(),
+            },
+        )
+        .await
+        .expect("accepted attempt becomes Unknown without losing acceptance");
+
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state.path().join("coordinator.sqlite3").display()
+    ))
+    .await
+    .expect("test reads durable evidence");
+    let evidence: (String, String) = sqlx::query_as("SELECT acceptance_evidence_json, ambiguity_evidence_json FROM supervisor_event_attempts WHERE event_id = ? AND attempt_number = 1")
+        .bind(event.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("first attempt evidence exists");
+    assert!(evidence.0.contains("immutable first acceptance"));
+    assert!(evidence.1.contains("visibility became ambiguous"));
+
+    coordinator
+        .execute(
+            ActorContext::Host {
+                capability: host.clone(),
+            },
+            CoordinatorCommand::ReconcileSupervisorEvent {
+                event_id: event.id,
+                resolution: herdr_harness_coordinator::core::SupervisorEventResolution::Retry,
+                audit_note: "native transcript inspected; retry is safe".to_owned(),
+            },
+        )
+        .await
+        .expect("Supervisor explicitly retries Unknown event");
+    coordinator
+        .execute(
+            ActorContext::Host {
+                capability: host.clone(),
+            },
+            CoordinatorCommand::ClaimNextSupervisorEvent,
+        )
+        .await
+        .expect("retry attempt claims");
+    coordinator
+        .execute(
+            ActorContext::Host {
+                capability: host.clone(),
+            },
+            CoordinatorCommand::AcceptSupervisorEvent {
+                event_id: event.id,
+                native_correlation: "second-correlation".to_owned(),
+                native_turn_id: None,
+                evidence: "second acceptance".to_owned(),
+            },
+        )
+        .await
+        .expect("retry accepted");
+    coordinator
+        .execute(
+            ActorContext::Host {
+                capability: host.clone(),
+            },
+            CoordinatorCommand::RecordSupervisorEventPresentation {
+                event_id: event.id,
+                phase: herdr_harness_coordinator::core::SupervisorPresentationPhase::TurnStarted,
+                native_turn_id: None,
+                evidence: "second turn started".to_owned(),
+            },
+        )
+        .await
+        .expect("retry turn evidence persists independently");
+    coordinator
+        .execute(
+            ActorContext::Host { capability: host },
+            CoordinatorCommand::RecordSupervisorEventPresentation {
+                event_id: event.id,
+                phase: herdr_harness_coordinator::core::SupervisorPresentationPhase::Presented,
+                native_turn_id: None,
+                evidence: "second presentation".to_owned(),
+            },
+        )
+        .await
+        .expect("retry presentation persists independently");
+    let presented: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM supervisor_event_observations WHERE event_id = ? AND observation_kind = 'presented'")
+        .bind(event.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("presentation observations count");
+    let timeouts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM supervisor_event_observations WHERE event_id = ? AND observation_kind = 'presentation_timeout'")
+        .bind(event.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("timeout observations count");
+    let turn_started: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM supervisor_event_observations WHERE event_id = ? AND observation_kind = 'turn_started'")
+        .bind(event.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("turn-start observations count");
+    assert_eq!(presented, 1);
+    assert_eq!(turn_started, 2);
+    assert_eq!(timeouts, 1);
+    pool.close().await;
 }
 
 #[tokio::test]

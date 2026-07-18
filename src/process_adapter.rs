@@ -573,6 +573,15 @@ impl HarnessAdapter for OmpProcessAdapter {
         self.start_session(spec, Some(session_id)).await
     }
 
+    async fn conversation_contains(&mut self, marker: &str) -> AdapterResult<bool> {
+        let id = self.0.id();
+        let messages = self
+            .0
+            .request(HarnessKind::Omp, json!({"type":"get_messages"}), id)
+            .await?;
+        Ok(messages.to_string().contains(marker))
+    }
+
     async fn dispatch(&mut self, delivery: ResolvedDelivery) -> AdapterResult<NativeAcceptance> {
         let command = match delivery.kind {
             NativeDeliveryKind::StartTurn => "prompt",
@@ -802,6 +811,27 @@ impl HarnessAdapter for CodexProcessAdapter {
             )
         })?;
         self.start_session(spec, Some(thread_id)).await
+    }
+
+    async fn conversation_contains(&mut self, marker: &str) -> AdapterResult<bool> {
+        let thread = self
+            .0
+            .state
+            .lock()
+            .await
+            .thread_id
+            .clone()
+            .ok_or_else(|| operation(HarnessKind::Codex, "thread is not established"))?;
+        let id = self.0.id();
+        let snapshot = self
+            .0
+            .request(
+                HarnessKind::Codex,
+                json!({"method":"thread/read","params":{"threadId":thread,"includeTurns":true}}),
+                id,
+            )
+            .await?;
+        Ok(snapshot.to_string().contains(marker))
     }
 
     async fn dispatch(&mut self, delivery: ResolvedDelivery) -> AdapterResult<NativeAcceptance> {
@@ -1084,7 +1114,7 @@ fn omp_reader(
 fn coordinator_bridge(spec: &HarnessStartSpec) -> Option<McpServer> {
     let socket = spec.environment.get("HERDR_COORDINATOR_SOCKET")?;
     let bearer = spec.environment.get("HERDR_HARNESS_CAPABILITY")?;
-    mcp::from_bearer(Path::new(socket), bearer.clone())
+    mcp::from_host_bearer(Path::new(socket), bearer.clone())
         .ok()
         .map(|bridge| bridge.with_native_turn_id("provider-turn"))
 }

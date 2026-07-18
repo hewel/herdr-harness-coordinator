@@ -150,6 +150,27 @@ impl HostConnectionCapability {
     fn digest(&self) -> String {
         hex::encode(Sha256::digest(self.0.as_bytes()))
     }
+
+    /// Parses the opaque bearer passed to a pane-resident provider bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bearer does not match the v1 Host capability shape.
+    pub fn from_bearer(value: impl Into<String>) -> Result<Self, CoordinatorError> {
+        let value = value.into();
+        let valid = value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(CoordinatorError::new(
+                ErrorCategory::Unauthenticated,
+                "Host connection capability has an invalid shape",
+            ))
+        }
+    }
 }
 
 /// Authenticated command/query actor.
@@ -193,6 +214,8 @@ pub enum CoordinatorCommand {
     DisconnectHostConnection { diagnostic: Option<String> },
     /// Expire stale Host connections and conservatively settle ambiguous work.
     ReapStaleHostConnections,
+    /// Atomically reserve one managed Supervisor pane reopen attempt.
+    PrepareSupervisorReconnect,
     /// Copy a regular file into immutable Coordinator-owned storage.
     AdmitAttachment {
         source: PathBuf,
@@ -388,6 +411,7 @@ pub enum SupervisorEventResolution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SupervisorPresentationPhase {
+    Presented,
     TurnStarted,
     TurnCompleted,
 }
@@ -684,6 +708,8 @@ pub enum CommandOutcome {
     HostConnectionDisconnected,
     /// Number of stale Host connections expired by the daemon.
     StaleHostConnectionsReaped { count: u32 },
+    /// Whether this daemon acquired the durable Supervisor reopen claim.
+    SupervisorReconnectPrepared { claimed: bool },
     /// File was copied, hashed, and indexed.
     AttachmentAdmitted { attachment: AttachmentMetadata },
     /// Inbox read markers were persisted.
@@ -894,6 +920,9 @@ impl Coordinator {
         match (actor, command) {
             (ActorContext::Bootstrap, CoordinatorCommand::ReapStaleHostConnections) => {
                 self.reap_stale_host_connections().await
+            }
+            (ActorContext::Bootstrap, CoordinatorCommand::PrepareSupervisorReconnect) => {
+                self.prepare_supervisor_reconnect().await
             }
             (ActorContext::Bootstrap, CoordinatorCommand::RegisterSupervisor { definition }) => {
                 self.register_supervisor(definition).await
@@ -1322,8 +1351,33 @@ impl Coordinator {
         command: CoordinatorCommand,
     ) -> Result<CommandOutcome, CoordinatorError> {
         match command {
+            CoordinatorCommand::AdmitAttachment {
+                source,
+                media_type,
+                original_name,
+            } => {
+                self.admit_attachment(source, media_type, original_name)
+                    .await
+            }
             CoordinatorCommand::MarkInboxRead { message_ids } => {
                 self.mark_inbox_read(actor, message_ids).await
+            }
+            CoordinatorCommand::StartWorker {
+                definition,
+                profile_snapshot,
+                profile_digest,
+            } => {
+                self.require_supervisor(actor)?;
+                self.start_worker(definition, profile_snapshot, profile_digest)
+                    .await
+            }
+            CoordinatorCommand::CreateTask { submission } => {
+                self.require_supervisor(actor)?;
+                self.create_task(actor, submission).await
+            }
+            CoordinatorCommand::DispatchTask { task_id } => {
+                self.require_supervisor(actor)?;
+                self.dispatch_task(task_id).await
             }
             CoordinatorCommand::ClaimNextTask => self.claim_next_task(actor).await,
             CoordinatorCommand::RotateWorkerSession => self.rotate_worker_session(actor).await,
@@ -1334,6 +1388,13 @@ impl Coordinator {
                 self.accept_delivery(actor, message_id, native_correlation)
                     .await
             }
+            CoordinatorCommand::SendMessage { submission } => {
+                self.send_message(actor, submission).await
+            }
+            CoordinatorCommand::CompleteTask {
+                manifest,
+                native_turn_id,
+            } => self.complete_task(actor, manifest, native_turn_id).await,
             CoordinatorCommand::RecordTurnCompleted {
                 task_id,
                 native_turn_id,
@@ -1346,12 +1407,55 @@ impl Coordinator {
                 self.record_cancellation_completed(actor, task_id, succeeded)
                     .await
             }
+            CoordinatorCommand::CaptureRepositoryObservation {
+                task_id,
+                checkpoint,
+            } => {
+                self.capture_repository_observation(actor, task_id, checkpoint)
+                    .await
+            }
+            CoordinatorCommand::ApproveTask {
+                task_id,
+                result_revision,
+                observation_digest,
+            } => {
+                self.require_supervisor(actor)?;
+                self.approve_task(task_id, result_revision, observation_digest)
+                    .await
+            }
+            CoordinatorCommand::CancelTask { task_id } => {
+                self.require_supervisor(actor)?;
+                self.cancel_task(task_id).await
+            }
             CoordinatorCommand::MarkDeliveryUnknown {
                 message_id,
                 diagnostic,
             } => {
                 self.mark_delivery_unknown(actor, message_id, diagnostic)
                     .await
+            }
+            CoordinatorCommand::ResolveDeliveryUnknown {
+                task_id,
+                resolution,
+                observation_digest,
+                audit_note,
+            } => {
+                self.require_supervisor(actor)?;
+                self.resolve_delivery_unknown(task_id, resolution, observation_digest, audit_note)
+                    .await
+            }
+            CoordinatorCommand::ClearWorktreeHold {
+                task_id,
+                observation_digest,
+                audit_note,
+            } => {
+                self.require_supervisor(actor)?;
+                self.clear_worktree_hold(task_id, observation_digest, audit_note)
+                    .await
+            }
+            CoordinatorCommand::StopWorker { worker_id } => {
+                self.require_supervisor(actor)?;
+                self.stop_worker(worker_id).await
             }
             CoordinatorCommand::RecordHostStopped { clean } => {
                 self.record_host_stopped(actor, clean).await
@@ -1428,6 +1532,27 @@ impl Coordinator {
             } => {
                 self.require_supervisor(actor)?;
                 self.release_supervisor_event(event_id, diagnostic).await
+            }
+            CoordinatorCommand::AcknowledgeSupervisorEvents { event_ids } => {
+                self.require_supervisor(actor)?;
+                self.acknowledge_supervisor_events(actor, event_ids).await
+            }
+            CoordinatorCommand::ReconcileSupervisorEvent {
+                event_id,
+                resolution,
+                audit_note,
+            } => {
+                self.require_supervisor(actor)?;
+                self.reconcile_supervisor_event(event_id, resolution, audit_note)
+                    .await
+            }
+            CoordinatorCommand::WatchTaskGraph {
+                root_task_ids,
+                request_key,
+            } => {
+                self.require_supervisor(actor)?;
+                self.watch_task_graph(actor, root_task_ids, request_key)
+                    .await
             }
             CoordinatorCommand::RecordSupervisorEventPresentation {
                 event_id,
@@ -5312,14 +5437,10 @@ impl Coordinator {
             ));
         }
         let phase_text = match phase {
+            SupervisorPresentationPhase::Presented => "presented",
             SupervisorPresentationPhase::TurnStarted => "turn_started",
             SupervisorPresentationPhase::TurnCompleted => "turn_completed",
         };
-        let observation_key = format!(
-            "{}:{phase_text}:{}",
-            event_id,
-            native_turn_id.as_deref().unwrap_or("none")
-        );
         let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
         let attempt = sqlx::query("SELECT id FROM supervisor_event_attempts WHERE event_id = ? AND target_session_id = ? AND state = 'accepted' ORDER BY attempt_number DESC LIMIT 1")
             .bind(event_id.to_string())
@@ -5328,6 +5449,12 @@ impl Coordinator {
             .await
             .map_err(CoordinatorError::storage)?
             .ok_or_else(|| CoordinatorError::new(ErrorCategory::InvalidState, "presentation evidence requires an accepted event attempt"))?;
+        let attempt_id = attempt.get::<&str, _>("id");
+        let observation_key = format!(
+            "{}:{attempt_id}:{phase_text}:{}",
+            event_id,
+            native_turn_id.as_deref().unwrap_or("none")
+        );
         let native = sqlx::query("SELECT native_session_id, native_thread_id FROM harness_sessions WHERE id = ? AND ended_at IS NULL")
             .bind(actor.session_id.to_string())
             .fetch_one(&mut *transaction)
@@ -5337,7 +5464,7 @@ impl Coordinator {
             .bind(Uuid::now_v7().to_string())
             .bind(observation_key)
             .bind(event_id.to_string())
-            .bind(attempt.get::<&str, _>("id"))
+            .bind(attempt_id)
             .bind(phase_text)
             .bind(native.get::<Option<&str>, _>("native_session_id"))
             .bind(native.get::<Option<&str>, _>("native_thread_id"))
@@ -5370,7 +5497,17 @@ impl Coordinator {
         }
         let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
         let now = timestamp();
-        let changed = sqlx::query("UPDATE supervisor_events SET state = 'unknown', updated_at = ? WHERE id = ? AND state = 'dispatching'")
+        let attempt = sqlx::query("SELECT id, target_session_id, state FROM supervisor_event_attempts WHERE event_id = ? AND state IN ('dispatching','accepted') ORDER BY attempt_number DESC LIMIT 1")
+            .bind(event_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::InvalidState, "event has no unsettled delivery attempt"))?;
+        let attempt_id = attempt.get::<&str, _>("id").to_owned();
+        let attempt_was_accepted = attempt.get::<&str, _>("state") == "accepted";
+        let diagnostic_json = serde_json::to_string(&json_evidence(&diagnostic))
+            .map_err(CoordinatorError::storage)?;
+        let changed = sqlx::query("UPDATE supervisor_events SET state = 'unknown', updated_at = ? WHERE id = ? AND state IN ('dispatching','accepted')")
             .bind(&now)
             .bind(event_id.to_string())
             .execute(&mut *transaction)
@@ -5380,16 +5517,39 @@ impl Coordinator {
         if changed != 1 {
             return Err(CoordinatorError::new(
                 ErrorCategory::InvalidState,
-                "only a dispatching Supervisor event may become Unknown",
+                "only a dispatching or accepted Supervisor event may become Unknown",
             ));
         }
-        sqlx::query("UPDATE supervisor_event_attempts SET state = 'unknown', provider_bytes_may_have_been_written = 1, acceptance_evidence_json = ?, updated_at = ? WHERE event_id = ? AND state = 'dispatching'")
-            .bind(serde_json::to_string(&json_evidence(&diagnostic)).map_err(CoordinatorError::storage)?)
+        sqlx::query("UPDATE supervisor_event_attempts SET state = 'unknown', provider_bytes_may_have_been_written = 1, ambiguity_evidence_json = ?, updated_at = ? WHERE id = ? AND state IN ('dispatching','accepted')")
+            .bind(&diagnostic_json)
             .bind(&now)
-            .bind(event_id.to_string())
+            .bind(&attempt_id)
             .execute(&mut *transaction)
             .await
             .map_err(CoordinatorError::storage)?;
+        if attempt_was_accepted {
+            let target_session_id = attempt.get::<&str, _>("target_session_id");
+            let native = sqlx::query(
+                "SELECT native_session_id, native_thread_id FROM harness_sessions WHERE id = ?",
+            )
+            .bind(target_session_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+            sqlx::query("INSERT OR IGNORE INTO supervisor_event_observations (id, observation_key, event_id, attempt_id, observation_kind, native_session_id, native_thread_id, native_turn_id, evidence_json, observed_at) SELECT ?, ?, ?, ?, 'presentation_timeout', ?, ?, NULL, ?, ? WHERE NOT EXISTS (SELECT 1 FROM supervisor_event_observations WHERE attempt_id = ? AND observation_kind = 'presented')")
+                .bind(Uuid::now_v7().to_string())
+                .bind(format!("{event_id}:{attempt_id}:presentation_timeout:none"))
+                .bind(event_id.to_string())
+                .bind(&attempt_id)
+                .bind(native.get::<Option<&str>, _>("native_session_id"))
+                .bind(native.get::<Option<&str>, _>("native_thread_id"))
+                .bind(&diagnostic_json)
+                .bind(&now)
+                .bind(&attempt_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
         transaction
             .commit()
             .await
@@ -5995,19 +6155,28 @@ impl Coordinator {
 
     async fn reap_stale_host_connections(&self) -> Result<CommandOutcome, CoordinatorError> {
         let now = timestamp();
-        let stale = sqlx::query("SELECT c.id AS connection_id, s.id AS session_id, h.id AS harness_id, h.tier FROM host_connections c JOIN harness_sessions s ON s.id = c.session_id JOIN harnesses h ON h.id = s.harness_id WHERE c.status = 'active' AND c.expires_at <= ? AND s.ended_at IS NULL ORDER BY c.expires_at")
+        let stale = sqlx::query("SELECT c.id AS connection_id, c.status, s.id AS session_id, h.id AS harness_id, h.tier FROM host_connections c JOIN harness_sessions s ON s.id = c.session_id JOIN harnesses h ON h.id = s.harness_id WHERE ((c.status = 'active' AND c.expires_at <= ?) OR (c.status = 'disconnected' AND c.disconnect_reason = 'presence lease expired; settlement pending')) AND c.generation = s.connection_generation AND s.ended_at IS NULL ORDER BY c.expires_at")
             .bind(&now)
             .fetch_all(&self.pool)
             .await
             .map_err(CoordinatorError::storage)?;
-        let changed = sqlx::query("UPDATE host_connections SET status = 'expired', disconnected_at = ?, disconnect_reason = 'presence lease expired' WHERE status = 'active' AND expires_at <= ?")
-            .bind(&now)
-            .bind(&now)
-            .execute(&self.pool)
-            .await
-            .map_err(CoordinatorError::storage)?
-            .rows_affected();
+        let mut changed = 0_u32;
         for row in stale {
+            let connection_id = row.get::<&str, _>("connection_id");
+            if row.get::<&str, _>("status") == "active" {
+                let claimed = sqlx::query("UPDATE host_connections SET status = 'disconnected', disconnected_at = ?, disconnect_reason = 'presence lease expired; settlement pending' WHERE id = ? AND status = 'active' AND expires_at <= ?")
+                    .bind(&now)
+                    .bind(connection_id)
+                    .bind(&now)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(CoordinatorError::storage)?
+                    .rows_affected();
+                if claimed != 1 {
+                    continue;
+                }
+            }
+            changed = changed.saturating_add(1);
             let tier = match row.get::<&str, _>("tier") {
                 "supervisor" => HarnessTier::Supervisor,
                 "worker" => HarnessTier::Worker,
@@ -6023,7 +6192,7 @@ impl Coordinator {
                     .map_err(CoordinatorError::storage)?,
                 tier,
                 session_id: parse_uuid_id(row.get("session_id"))?,
-                host_connection_id: Some(row.get::<&str, _>("connection_id").to_owned()),
+                host_connection_id: Some(connection_id.to_owned()),
             };
             if tier == HarnessTier::Supervisor {
                 self.record_supervisor_disconnected(
@@ -6031,30 +6200,56 @@ impl Coordinator {
                     Some("managed Supervisor presence lease expired".to_owned()),
                 )
                 .await?;
-                continue;
+            } else {
+                let dispatching_message: Option<String> = sqlx::query_scalar("SELECT m.id FROM tasks t JOIN messages m ON m.task_id = t.id AND m.kind = 'task' WHERE t.worker_id = ? AND t.state = 'dispatching' ORDER BY t.created_sequence, m.created_sequence LIMIT 1")
+                    .bind(actor.id.as_str())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(CoordinatorError::storage)?;
+                if let Some(message_id) = dispatching_message {
+                    self.mark_delivery_unknown(
+                        &actor,
+                        parse_uuid_id(&message_id)?,
+                        "Worker Host presence expired during native Task dispatch".to_owned(),
+                    )
+                    .await?;
+                } else {
+                    self.record_host_failed(
+                        &actor,
+                        "Worker Host presence lease expired without a clean disconnect".to_owned(),
+                    )
+                    .await?;
+                }
             }
-            let dispatching_message: Option<String> = sqlx::query_scalar("SELECT m.id FROM tasks t JOIN messages m ON m.task_id = t.id AND m.kind = 'task' WHERE t.worker_id = ? AND t.state = 'dispatching' ORDER BY t.created_sequence, m.created_sequence LIMIT 1")
-                .bind(actor.id.as_str())
-                .fetch_optional(&self.pool)
+            sqlx::query("UPDATE host_connections SET status = 'expired', disconnected_at = ?, disconnect_reason = 'presence lease expired; settlement complete' WHERE id = ? AND status = 'disconnected' AND disconnect_reason = 'presence lease expired; settlement pending'")
+                .bind(&now)
+                .bind(connection_id)
+                .execute(&self.pool)
                 .await
                 .map_err(CoordinatorError::storage)?;
-            if let Some(message_id) = dispatching_message {
-                self.mark_delivery_unknown(
-                    &actor,
-                    parse_uuid_id(&message_id)?,
-                    "Worker Host presence expired during native Task dispatch".to_owned(),
-                )
-                .await?;
-            } else {
-                self.record_host_failed(
-                    &actor,
-                    "Worker Host presence lease expired without a clean disconnect".to_owned(),
-                )
-                .await?;
-            }
         }
-        Ok(CommandOutcome::StaleHostConnectionsReaped {
-            count: u32::try_from(changed).map_err(CoordinatorError::storage)?,
+        sqlx::query("UPDATE host_connections SET status = 'expired', disconnected_at = COALESCE(disconnected_at, ?), disconnect_reason = 'presence lease settlement already completed or superseded' WHERE status = 'disconnected' AND disconnect_reason = 'presence lease expired; settlement pending' AND (session_id IN (SELECT id FROM harness_sessions WHERE ended_at IS NOT NULL) OR generation <> (SELECT connection_generation FROM harness_sessions WHERE id = host_connections.session_id))")
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::StaleHostConnectionsReaped { count: changed })
+    }
+
+    async fn prepare_supervisor_reconnect(&self) -> Result<CommandOutcome, CoordinatorError> {
+        let now = Utc::now();
+        let retry_before =
+            (now - chrono::Duration::seconds(45)).to_rfc3339_opts(SecondsFormat::Micros, true);
+        let now = now.to_rfc3339_opts(SecondsFormat::Micros, true);
+        let changed = sqlx::query("UPDATE harness_sessions SET presence = 'reconnecting', last_seen_at = ? WHERE harness_tier = 'supervisor' AND ended_at IS NULL AND (presence = 'disconnected' OR (presence = 'reconnecting' AND last_seen_at <= ?))")
+            .bind(&now)
+            .bind(retry_before)
+            .execute(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        Ok(CommandOutcome::SupervisorReconnectPrepared {
+            claimed: changed == 1,
         })
     }
 
@@ -6063,11 +6258,9 @@ impl Coordinator {
         capability: &SessionCapability,
     ) -> Result<AuthenticatedActor, CoordinatorError> {
         let row = sqlx::query(
-            "SELECT h.id, h.tier, s.id AS session_id, NULL AS connection_id FROM harness_sessions s JOIN harnesses h ON h.id = s.harness_id WHERE s.capability_hash = ? AND s.ended_at IS NULL AND s.presence IN ('starting', 'online', 'disconnected', 'offline') UNION ALL SELECT h.id, h.tier, s.id AS session_id, c.id AS connection_id FROM host_connections c JOIN harness_sessions s ON s.id = c.session_id JOIN harnesses h ON h.id = s.harness_id WHERE c.capability_hash = ? AND c.status = 'active' AND c.expires_at > ? AND c.generation = s.connection_generation AND s.ended_at IS NULL LIMIT 1",
+            "SELECT h.id, h.tier, s.id AS session_id FROM harness_sessions s JOIN harnesses h ON h.id = s.harness_id WHERE s.capability_hash = ? AND s.ended_at IS NULL AND s.presence IN ('starting', 'online', 'disconnected', 'reconnecting', 'offline')",
         )
         .bind(capability.digest())
-        .bind(capability.digest())
-        .bind(timestamp())
         .fetch_optional(&self.pool)
         .await
         .map_err(CoordinatorError::storage)?
@@ -6092,9 +6285,7 @@ impl Coordinator {
             id,
             tier,
             session_id,
-            host_connection_id: row
-                .get::<Option<&str>, _>("connection_id")
-                .map(str::to_owned),
+            host_connection_id: None,
         })
     }
 
@@ -6930,8 +7121,29 @@ async fn mark_unsettled_supervisor_delivery_unknown(
 ) -> Result<(), CoordinatorError> {
     let evidence =
         serde_json::to_string(&json_evidence(diagnostic)).map_err(CoordinatorError::storage)?;
-    sqlx::query("UPDATE supervisor_event_attempts SET state = 'unknown', provider_bytes_may_have_been_written = 1, acceptance_evidence_json = ?, updated_at = ? WHERE state IN ('dispatching','accepted')")
-        .bind(evidence)
+    let accepted = sqlx::query("SELECT a.id, a.event_id, a.target_session_id, s.native_session_id, s.native_thread_id FROM supervisor_event_attempts a JOIN harness_sessions s ON s.id = a.target_session_id WHERE a.state = 'accepted'")
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+    for attempt in accepted {
+        let attempt_id = attempt.get::<&str, _>("id");
+        let event_id = attempt.get::<&str, _>("event_id");
+        sqlx::query("INSERT OR IGNORE INTO supervisor_event_observations (id, observation_key, event_id, attempt_id, observation_kind, native_session_id, native_thread_id, native_turn_id, evidence_json, observed_at) SELECT ?, ?, ?, ?, 'presentation_timeout', ?, ?, NULL, ?, ? WHERE NOT EXISTS (SELECT 1 FROM supervisor_event_observations WHERE attempt_id = ? AND observation_kind = 'presented')")
+            .bind(Uuid::now_v7().to_string())
+            .bind(format!("{event_id}:{attempt_id}:presentation_timeout:none"))
+            .bind(event_id)
+            .bind(attempt_id)
+            .bind(attempt.get::<Option<&str>, _>("native_session_id"))
+            .bind(attempt.get::<Option<&str>, _>("native_thread_id"))
+            .bind(&evidence)
+            .bind(now)
+            .bind(attempt_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+    }
+    sqlx::query("UPDATE supervisor_event_attempts SET state = 'unknown', provider_bytes_may_have_been_written = 1, ambiguity_evidence_json = ?, updated_at = ? WHERE state IN ('dispatching','accepted')")
+        .bind(&evidence)
         .bind(now)
         .execute(&mut **transaction)
         .await

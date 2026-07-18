@@ -86,7 +86,7 @@ validate_host_pid() {
   session_id=${3:-}
   kill -0 "$pid" 2>/dev/null || return 1
   executable=$(readlink -f "/proc/$pid/exe") || return 1
-  [ "$(basename "$executable")" = "herdr-harness-coordinator" ] || return 1
+  [ "$executable" = "$candidate" ] || return 1
   argv_has "$pid" "$subcommand" || return 1
   argv_has "$pid" "$state_dir" || return 1
   if [ -n "$session_id" ]; then
@@ -234,6 +234,7 @@ case "$phase" in
     }
     original_start=$(pid_start_time "$supervisor_pid")
     attempt_count=$(sql_value "SELECT COUNT(*) FROM supervisor_event_attempts WHERE event_id = '$event_id'")
+    native_before=$(sql_value "SELECT COALESCE(native_session_id, '') || '|' || COALESCE(native_thread_id, '') FROM harness_sessions WHERE harness_tier = 'supervisor' AND ended_at IS NULL")
     capture before
     event_state=$(sql_value "SELECT state FROM supervisor_events WHERE id = '$event_id'")
     case "$event_state" in dispatching|accepted) ;; *)
@@ -272,6 +273,16 @@ case "$phase" in
     replacement_pid=$(sed -n '1p' "$pid_file")
     validate_host_pid "$replacement_pid" supervisor-host || {
       echo "replacement Supervisor Host identity could not be proved" >&2
+      exit 1
+    }
+    attempts=0
+    while [ "$(sql_value "SELECT presence FROM harness_sessions WHERE harness_tier = 'supervisor' AND ended_at IS NULL")" != online ]; do
+      attempts=$((attempts + 1)); [ "$attempts" -lt 300 ] || { echo "replacement Supervisor did not complete exact native rebind" >&2; exit 1; }
+      sleep 0.1
+    done
+    native_after=$(sql_value "SELECT COALESCE(native_session_id, '') || '|' || COALESCE(native_thread_id, '') FROM harness_sessions WHERE harness_tier = 'supervisor' AND ended_at IS NULL")
+    [ "$native_after" = "$native_before" ] || {
+      echo "replacement Supervisor did not preserve exact native identity: $native_before -> $native_after" >&2
       exit 1
     }
     capture after-rebind

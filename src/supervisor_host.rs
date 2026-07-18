@@ -25,6 +25,7 @@ use crate::{
         ActorContext, CommandOutcome, CoordinatorCommand, CoordinatorQuery,
         HostConnectionCapability, QueryResult, SessionCapability,
     },
+    host_presence::HostHeartbeat,
     process_adapter::{CodexProcessAdapter, OmpProcessAdapter},
 };
 
@@ -67,6 +68,11 @@ pub async fn run_managed_supervisor_host(
     else {
         bail!("Coordinator returned the wrong Host connection outcome")
     };
+    let mut heartbeat = HostHeartbeat::spawn(
+        socket.to_path_buf(),
+        host_capability.clone(),
+        Duration::from_secs(2),
+    );
     let mut environment = inherited_supervisor_environment();
     environment.insert(
         "HERDR_HARNESS_CAPABILITY".to_owned(),
@@ -75,6 +81,7 @@ pub async fn run_managed_supervisor_host(
             .context("Supervisor Host capability did not serialize as text")?
             .to_owned(),
     );
+    environment.insert("HERDR_HARNESS_ACTOR".to_owned(), "host".to_owned());
     environment.insert(
         "HERDR_COORDINATOR_SOCKET".to_owned(),
         socket.to_string_lossy().into_owned(),
@@ -153,10 +160,14 @@ pub async fn run_managed_supervisor_host(
     )
     .await?;
     let mut events = adapter.events();
-    let mut accepted_event: Option<(crate::contract::SupervisorEventId, Option<String>)> = None;
+    let mut accepted_event: Option<(
+        crate::contract::SupervisorEventId,
+        Option<String>,
+        tokio::time::Instant,
+        bool,
+    )> = None;
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
     println!(
         "Managed {:?} Supervisor ready. Type a request and press Enter.",
         adapter.kind()
@@ -174,14 +185,43 @@ pub async fn run_managed_supervisor_host(
                     eprintln!("Supervisor prompt was not accepted: {error}");
                 }
             }
-            _ = heartbeat.tick() => {
-                broker_execute(
-                    socket,
-                    host_capability.clone(),
-                    CoordinatorCommand::RenewHostConnection,
-                ).await?;
-            }
+            error = heartbeat.failed() => return Err(error),
             _ = ticker.tick() => {
+                if let Some((event_id, _, accepted_at, presented)) = &accepted_event
+                    && !presented
+                {
+                    let event_id = *event_id;
+                    let timed_out = accepted_at.elapsed() >= Duration::from_secs(30);
+                    match adapter.verify_event_visible(&native, event_id).await {
+                        Ok(evidence) => {
+                            broker_execute(
+                                socket,
+                                host_capability.clone(),
+                                CoordinatorCommand::RecordSupervisorEventPresentation {
+                                    event_id,
+                                    phase: crate::core::SupervisorPresentationPhase::Presented,
+                                    native_turn_id: None,
+                                    evidence,
+                                },
+                            ).await?;
+                            if let Some(current) = accepted_event.as_mut() {
+                                current.3 = true;
+                            }
+                        }
+                        Err(error) if timed_out => {
+                            broker_execute(
+                                socket,
+                                host_capability.clone(),
+                                CoordinatorCommand::MarkSupervisorEventUnknown {
+                                    event_id,
+                                    diagnostic: format!("provider accepted injection but visible Event marker was not observed within 30 seconds: {error}"),
+                                },
+                            ).await?;
+                            accepted_event = None;
+                        }
+                        Err(_) => {}
+                    }
+                }
                 let snapshot = adapter.snapshot().await.context("snapshotting Supervisor")?;
                 let may_claim = snapshot.lifecycle == AdapterLifecycle::Idle;
                 if !may_claim {
@@ -228,7 +268,23 @@ pub async fn run_managed_supervisor_host(
                                 evidence: acceptance.evidence,
                             },
                         ).await?;
-                        accepted_event = Some((durable.id, accepted_turn_id));
+                        let presented = match adapter.verify_event_visible(&native, durable.id).await {
+                            Ok(evidence) => {
+                                broker_execute(
+                                    socket,
+                                    host_capability.clone(),
+                                    CoordinatorCommand::RecordSupervisorEventPresentation {
+                                        event_id: durable.id,
+                                        phase: crate::core::SupervisorPresentationPhase::Presented,
+                                        native_turn_id: accepted_turn_id.clone(),
+                                        evidence,
+                                    },
+                                ).await?;
+                                true
+                            }
+                            Err(_) => false,
+                        };
+                        accepted_event = Some((durable.id, accepted_turn_id, tokio::time::Instant::now(), presented));
                     }
                     Err(error) if error.provider_bytes_may_have_been_written() => {
                         broker_execute(
@@ -255,7 +311,7 @@ pub async fn run_managed_supervisor_host(
             event = events.next() => {
                 match event {
                     Some(Ok(SupervisorAdapterEvent::TurnStarted { turn_id })) => {
-                        if let Some((event_id, expected_turn)) = &accepted_event
+                        if let Some((event_id, expected_turn, _, _)) = &accepted_event
                             && (expected_turn.is_none() || turn_id.is_none() || expected_turn == &turn_id)
                         {
                             broker_execute(
@@ -271,7 +327,7 @@ pub async fn run_managed_supervisor_host(
                         }
                     }
                     Some(Ok(SupervisorAdapterEvent::TurnCompleted { turn_id, .. })) => {
-                        if let Some((event_id, expected_turn)) = &accepted_event
+                        if let Some((event_id, expected_turn, _, _)) = &accepted_event
                             && (expected_turn.is_none() || turn_id.is_none() || expected_turn == &turn_id)
                         {
                             broker_execute(
@@ -643,6 +699,30 @@ impl SupervisorAdapter for ProcessSupervisorAdapter {
             steerable: snapshot.steerable,
             native_health: snapshot.native_health,
         })
+    }
+
+    async fn verify_event_visible(
+        &mut self,
+        session: &NativeSupervisorSession,
+        event_id: crate::contract::SupervisorEventId,
+    ) -> AdapterResult<String> {
+        self.require_session(session)?;
+        if self
+            .adapter
+            .conversation_contains(&event_id.to_string())
+            .await?
+        {
+            Ok(format!(
+                "provider conversation snapshot contains Coordinator Event ID {event_id}"
+            ))
+        } else {
+            Err(AdapterError::Operation {
+                kind: self.kind(),
+                message: format!(
+                    "provider conversation snapshot does not contain Coordinator Event ID {event_id}"
+                ),
+            })
+        }
     }
 
     fn events(&mut self) -> SupervisorAdapterEventStream {

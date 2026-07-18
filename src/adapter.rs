@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::contract::{
     AttachmentId, CodexApprovalPolicy, CodexSandboxMode, HarnessKind, HarnessSessionId,
-    HarnessTier, NativeSessionHealth, SupervisorEvent, TaskId,
+    HarnessTier, NativeSessionHealth, SupervisorEvent, SupervisorEventId, TaskId,
 };
 
 const MAX_VERSION_OUTPUT_BYTES: usize = 4096;
@@ -347,6 +347,9 @@ pub trait HarnessAdapter: Send {
         target: &NativeSessionResume,
     ) -> AdapterResult<NativeSession>;
 
+    /// Proves that a marker is present in the provider's bound conversation snapshot.
+    async fn conversation_contains(&mut self, marker: &str) -> AdapterResult<bool>;
+
     /// Delivers authorized input and returns only native acceptance evidence.
     ///
     /// # Errors
@@ -474,6 +477,13 @@ pub trait SupervisorAdapter: Send {
     ) -> AdapterResult<NativeAcceptance>;
 
     async fn snapshot(&mut self) -> AdapterResult<SupervisorSnapshot>;
+
+    /// Reads the bound native conversation and proves the durable Event marker is visible.
+    async fn verify_event_visible(
+        &mut self,
+        session: &NativeSupervisorSession,
+        event_id: SupervisorEventId,
+    ) -> AdapterResult<String>;
 
     fn events(&mut self) -> SupervisorAdapterEventStream;
 }

@@ -24,6 +24,7 @@ use crate::{
         HarnessCompatibilityEvidenceV1, HostConnectionCapability, InboxMessageView, QueryResult,
         SessionCapability, TaskState,
     },
+    host_presence::HostHeartbeat,
     process_adapter::{CodexProcessAdapter, OmpProcessAdapter},
     profile::{parse_launch_profile_snapshot, resolve_executable},
 };
@@ -118,6 +119,11 @@ async fn run_worker_host_inner(
         bail!("Coordinator returned the wrong Host connection outcome")
     };
     let capability = host_capability;
+    let mut heartbeat = HostHeartbeat::spawn(
+        socket.to_path_buf(),
+        capability.clone(),
+        Duration::from_secs(2),
+    );
     environment.insert(
         "HERDR_HARNESS_CAPABILITY".to_owned(),
         serde_json::to_value(&capability)?
@@ -125,6 +131,7 @@ async fn run_worker_host_inner(
             .context("Host connection capability did not serialize as a bearer")?
             .to_owned(),
     );
+    environment.insert("HERDR_HARNESS_ACTOR".to_owned(), "host".to_owned());
     environment.insert(
         "HERDR_COORDINATOR_SOCKET".to_owned(),
         socket.to_string_lossy().into_owned(),
@@ -214,16 +221,9 @@ async fn run_worker_host_inner(
     let mut cancellation_started = None;
     let mut event_sequence = session.event_sequence;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! {
-            _ = heartbeat.tick() => {
-                broker_execute(
-                    socket,
-                    capability.clone(),
-                    CoordinatorCommand::RenewHostConnection,
-                ).await?;
-            }
+            error = heartbeat.failed() => return Err(error),
             _ = ticker.tick() => {
                 if current_task.is_none() {
                     let snapshot = adapter.snapshot().await.context("refreshing native Harness snapshot")?;
