@@ -1,13 +1,53 @@
 use std::{path::PathBuf, sync::Arc};
 
 use herdr_harness_coordinator::{
-    broker::{BrokerOperation, BrokerRequest, BrokerServer, call},
+    broker::{BrokerOperation, BrokerRequest, BrokerServer, call, call_with_connect_retry},
     contract::{HarnessDefinitionV1, HarnessId, HarnessKind, HarnessTier, SCHEMA_VERSION},
     core::{
         ActorContext, CommandOutcome, Coordinator, CoordinatorCommand, CoordinatorQuery,
         QueryResult,
     },
 };
+
+#[tokio::test]
+async fn broker_retries_only_prewrite_connect_failures_during_handoff() {
+    let state = tempfile::tempdir().expect("state directory");
+    let socket = state.path().join("delayed.sock");
+    let request = BrokerRequest {
+        schema_version: SCHEMA_VERSION,
+        request_id: "handoff-connect".to_owned(),
+        operation: BrokerOperation::Query {
+            actor: ActorContext::Bootstrap,
+            query: CoordinatorQuery::ListHarnesses,
+        },
+    };
+    let first = call(&socket, &request)
+        .await
+        .expect_err("missing socket must fail before write");
+    assert!(first.is_retry_safe_connect());
+
+    let coordinator = std::sync::Arc::new(
+        Coordinator::open(state.path().join("coordinator"))
+            .await
+            .expect("Coordinator must open"),
+    );
+    let delayed_socket = socket.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let server = BrokerServer::bind(coordinator, delayed_socket)
+            .await
+            .expect("delayed broker must bind");
+        server.serve().await.expect("broker must serve");
+    });
+    let response = call_with_connect_retry(&socket, &request, std::time::Duration::from_secs(2))
+        .await
+        .expect("pre-write handoff gap must reconnect");
+    assert_eq!(response.request_id.as_deref(), Some("handoff-connect"));
+    assert!(
+        response.error.is_some(),
+        "Bootstrap query remains forbidden"
+    );
+}
 
 #[tokio::test]
 async fn unix_jsonl_broker_round_trips_capability_authenticated_core_calls() {

@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path, t
 use futures::StreamExt;
 use herdr_harness_coordinator::{
     adapter::{
-        AdapterEvent, HarnessAdapter, HarnessStartSpec, NativeDeliveryKind, ResolvedDelivery,
+        AdapterEvent, HarnessAdapter, HarnessStartSpec, NativeDeliveryKind, NativeSessionResume,
+        ResolvedDelivery,
     },
     contract::{HarnessSessionId, TaskId},
     process_adapter::{CodexProcessAdapter, OmpProcessAdapter},
@@ -19,6 +20,61 @@ fn executable(directory: &Path, name: &str, source: &str) -> std::path::PathBuf 
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).expect("make provider executable");
     path
+}
+
+#[tokio::test]
+async fn omp_process_adapter_resumes_the_exact_native_session() {
+    let temp = TempDir::new().expect("temp directory");
+    let arguments = temp.path().join("omp-arguments");
+    let provider = executable(
+        temp.path(),
+        "fake-omp-resume",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'omp/17.0.4'; exit 0; fi
+printf '%s\n' "$@" > "$ARGS_PATH"
+echo '{"type":"ready"}'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"type":"set_host_tools"'*) printf '{"type":"response","id":"%s","command":"set_host_tools","success":true,"data":{}}\n' "$id" ;;
+    *'"type":"get_state"'*) printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"sessionId":"omp-existing","isStreaming":false,"queuedMessageCount":0,"model":{"id":"fixture-model"}}}\n' "$id" ;;
+  esac
+done
+"#,
+    );
+    let mut resume_spec = spec(&temp, provider);
+    resume_spec.environment.insert(
+        "ARGS_PATH".to_owned(),
+        arguments.to_string_lossy().into_owned(),
+    );
+    let mut adapter = OmpProcessAdapter::new().with_timeouts(
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
+
+    let native = adapter
+        .resume(
+            &resume_spec,
+            &NativeSessionResume {
+                session_id: Some("omp-existing".to_owned()),
+                thread_id: None,
+            },
+        )
+        .await
+        .expect("resume OMP Session");
+
+    assert_eq!(native.session_id.as_deref(), Some("omp-existing"));
+    let arguments = fs::read_to_string(arguments).expect("captured OMP arguments");
+    assert!(
+        arguments
+            .lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair == ["--resume", "omp-existing"]),
+        "OMP must receive the exact durable Session ID: {arguments}"
+    );
+    adapter.stop().await.expect("clean OMP shutdown");
 }
 
 fn spec(temp: &TempDir, executable: std::path::PathBuf) -> HarnessStartSpec {
@@ -143,6 +199,7 @@ while IFS= read -r line; do
     *'"method":"initialize"'*) printf '{"id":"%s","result":{"serverInfo":{"name":"fixture"}}}\n' "$id" ;;
     *'"method":"initialized"'*) ;;
     *'"method":"thread/start"'*) printf '{"id":"%s","result":{"thread":{"id":"thread-1","cwd":"%s","model":"fixture-model"}}}\n' "$id" "$PWD" ;;
+    *'"method":"mcpServerStatus/list"'*) printf '{"id":"%s","error":{"code":-32601,"message":"method not found"}}\n' "$id" ;;
     *'"method":"turn/start"'*)
       printf '{"id":"%s","result":{"turn":{"id":"turn-1"}}}\n' "$id"
       echo '{"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn"}}}'
@@ -197,6 +254,134 @@ done
     adapter.stop().await.expect("clean Codex shutdown");
 }
 
+#[tokio::test]
+async fn codex_process_adapter_resumes_the_exact_thread_after_mcp_readiness() {
+    let temp = TempDir::new().expect("temp directory");
+    let methods = temp.path().join("codex-methods");
+    let provider = executable(
+        temp.path(),
+        "fake-codex-resume",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'codex-cli 0.144.5'; exit 0; fi
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+  [ -z "$method" ] || printf '%s\n' "$method" >> "$METHODS_PATH"
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":"%s","result":{"serverInfo":{"name":"fixture"}}}\n' "$id" ;;
+    *'"method":"initialized"'*) ;;
+    *'"method":"thread/start"'*) printf '{"id":"%s","error":{"code":-32600,"message":"fresh start is forbidden during resume"}}\n' "$id" ;;
+    *'"method":"thread/resume"'*) printf '{"id":"%s","result":{"thread":{"id":"thread-existing"},"cwd":"%s","model":"fixture-model"}}\n' "$id" "$PWD" ;;
+    *'"method":"mcpServerStatus/list"'*) printf '{"id":"%s","result":{"data":[{"name":"herdr","serverInfo":null,"tools":{"harness_list":{},"harness_status":{},"harness_inbox":{},"harness_request":{},"harness_send":{},"harness_complete":{},"harness_attachment_create":{}},"resources":[],"resourceTemplates":[],"authStatus":"notLoginRequired"}],"nextCursor":null}}\n' "$id" ;;
+  esac
+done
+"#,
+    );
+    let mut resume_spec = spec(&temp, provider);
+    resume_spec.environment.insert(
+        "METHODS_PATH".to_owned(),
+        methods.to_string_lossy().into_owned(),
+    );
+    let mut adapter = CodexProcessAdapter::new().with_timeouts(
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
+
+    let native = adapter
+        .resume(
+            &resume_spec,
+            &NativeSessionResume {
+                session_id: None,
+                thread_id: Some("thread-existing".to_owned()),
+            },
+        )
+        .await
+        .expect("resume Codex thread");
+
+    assert_eq!(native.thread_id.as_deref(), Some("thread-existing"));
+    let methods = fs::read_to_string(methods).expect("captured Codex methods");
+    assert!(methods.contains("thread/resume"));
+    assert!(methods.contains("mcpServerStatus/list"));
+    assert!(!methods.contains("thread/start"));
+    adapter.stop().await.expect("clean Codex shutdown");
+}
+
+#[tokio::test]
+async fn codex_process_adapter_rejects_resume_identity_drift() {
+    let temp = TempDir::new().expect("temp directory");
+    let provider = executable(
+        temp.path(),
+        "fake-codex-resume-drift",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'codex-cli 0.144.5'; exit 0; fi
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":"%s","result":{"serverInfo":{"name":"fixture"}}}\n' "$id" ;;
+    *'"method":"initialized"'*) ;;
+    *'"method":"thread/resume"'*) printf '{"id":"%s","result":{"thread":{"id":"different-thread"},"cwd":"%s","model":"fixture-model"}}\n' "$id" "$PWD" ;;
+  esac
+done
+"#,
+    );
+    let mut adapter = CodexProcessAdapter::new().with_timeouts(
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
+
+    let error = adapter
+        .resume(
+            &spec(&temp, provider),
+            &NativeSessionResume {
+                session_id: None,
+                thread_id: Some("thread-existing".to_owned()),
+            },
+        )
+        .await
+        .expect_err("resume identity drift must fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("resumed thread identity mismatch")
+    );
+}
+
+#[tokio::test]
+async fn codex_process_adapter_fails_closed_when_herdr_mcp_tools_are_missing() {
+    let temp = TempDir::new().expect("temp directory");
+    let provider = executable(
+        temp.path(),
+        "fake-codex-missing-mcp",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'codex-cli 0.144.5'; exit 0; fi
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":"%s","result":{"serverInfo":{"name":"fixture"}}}\n' "$id" ;;
+    *'"method":"initialized"'*) ;;
+    *'"method":"thread/start"'*) printf '{"id":"%s","result":{"thread":{"id":"thread-1","cwd":"%s","model":"fixture-model"}}}\n' "$id" "$PWD" ;;
+    *'"method":"mcpServerStatus/list"'*) printf '{"id":"%s","result":{"data":[],"nextCursor":null}}\n' "$id" ;;
+  esac
+done
+"#,
+    );
+    let mut adapter = CodexProcessAdapter::new().with_timeouts(
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
+
+    let error = adapter
+        .start(&spec(&temp, provider))
+        .await
+        .expect_err("missing herdr MCP readiness must fail startup");
+
+    assert!(error.to_string().contains("herdr MCP server is not ready"));
+}
+
 #[test]
 fn codex_process_adapter_reports_orchestrated_completion_tools() {
     let adapter = CodexProcessAdapter::new();
@@ -226,6 +411,7 @@ while IFS= read -r line; do
     *'"method":"initialize"'*) printf '{"id":"%s","result":{"serverInfo":{"name":"fixture"}}}\n' "$id" ;;
     *'"method":"initialized"'*) ;;
     *'"method":"thread/start"'*) printf '{"id":"%s","result":{"thread":{"id":"thread-1","cwd":"%s","model":"fixture-model"}}}\n' "$id" "$PWD" ;;
+    *'"method":"mcpServerStatus/list"'*) printf '{"id":"%s","error":{"code":-32601,"message":"method not found"}}\n' "$id" ;;
   esac
 done
 "#,
@@ -274,6 +460,7 @@ while IFS= read -r line; do
     *'"method":"initialize"'*) printf '{"id":"%s","result":{"serverInfo":{"name":"fixture"}}}\n' "$id" ;;
     *'"method":"initialized"'*) ;;
     *'"method":"thread/start"'*) printf '{"id":"%s","result":{"thread":{"id":"thread-1","cwd":"%s","model":"fixture-model"}}}\n' "$id" "$PWD" ;;
+    *'"method":"mcpServerStatus/list"'*) printf '{"id":"%s","error":{"code":-32601,"message":"method not found"}}\n' "$id" ;;
     *'"method":"thread/read"'*'"includeTurns":true'*) printf '{"id":"%s","error":{"code":-32600,"message":"thread is not materialized yet; includeTurns is unavailable before first user message"}}\n' "$id" ;;
     *'"method":"thread/read"'*) printf '{"id":"%s","result":{"thread":{"id":"thread-1"}}}\n' "$id" ;;
   esac

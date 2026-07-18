@@ -152,6 +152,15 @@ pub struct NativeSession {
     pub model: Option<String>,
 }
 
+/// Exact provider-native identity requested for deliberate Supervisor recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSessionResume {
+    /// OMP Session identity, when resuming OMP.
+    pub session_id: Option<String>,
+    /// Codex thread identity, when resuming Codex.
+    pub thread_id: Option<String>,
+}
+
 /// Provider-independent delivery operation selected by the Coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -326,6 +335,18 @@ pub trait HarnessAdapter: Send {
     /// Returns [`AdapterError`] when version checks, launch, or initialization fail.
     async fn start(&mut self, spec: &HarnessStartSpec) -> AdapterResult<NativeSession>;
 
+    /// Starts a provider process attached to an exact existing native conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] when the provider cannot resume the requested identity or
+    /// reports a different native conversation.
+    async fn resume(
+        &mut self,
+        spec: &HarnessStartSpec,
+        target: &NativeSessionResume,
+    ) -> AdapterResult<NativeSession>;
+
     /// Delivers authorized input and returns only native acceptance evidence.
     ///
     /// # Errors
@@ -374,6 +395,8 @@ pub trait HarnessAdapter: Send {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorBindSpec {
     pub coordinator_session_id: HarnessSessionId,
+    /// Exact native identity to resume after a managed Host reconnect.
+    pub resume: Option<NativeSessionResume>,
     pub executable: PathBuf,
     pub cwd: PathBuf,
     pub provider_state_dir: PathBuf,

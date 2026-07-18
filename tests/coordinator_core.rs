@@ -12,8 +12,8 @@ use herdr_harness_coordinator::{
     },
     core::{
         ActorContext, CommandOutcome, Coordinator, CoordinatorCommand, CoordinatorQuery,
-        DeliveryUnknownResolution, HarnessCompatibilityEvidenceV1, QueryResult, SessionCapability,
-        TaskSchedulingState, TaskState,
+        DeliveryUnknownResolution, ErrorCategory, HarnessCompatibilityEvidenceV1, QueryResult,
+        SessionCapability, TaskSchedulingState, TaskState,
     },
 };
 use sha2::{Digest, Sha256};
@@ -775,6 +775,108 @@ async fn worker_host_failure_records_repository_evidence_and_a_hold() {
 }
 
 #[tokio::test]
+async fn worker_loss_after_result_preserves_review_and_rejects_session_reuse() {
+    let (state, coordinator, supervisor, worker, task_id) = seeded_task().await;
+    let evidence_path = state.path().join("worker-loss-verification.txt");
+    std::fs::write(&evidence_path, "verification passed before Worker loss\n")
+        .expect("evidence fixture");
+    let CommandOutcome::AttachmentAdmitted { attachment } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::AdmitAttachment {
+                source: evidence_path,
+                media_type: "text/plain".to_owned(),
+                original_name: "worker-loss-verification.txt".to_owned(),
+            },
+        )
+        .await
+        .expect("Worker must admit verification evidence")
+    else {
+        panic!("attachment admission must return metadata")
+    };
+    let CommandOutcome::TaskDispatching { message_id, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::DispatchTask { task_id },
+        )
+        .await
+        .expect("Task must dispatch")
+    else {
+        panic!("dispatch must return its Message")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::AcceptDelivery {
+                message_id,
+                native_correlation: "native-turn-reviewing".to_owned(),
+            },
+        )
+        .await
+        .expect("provider must accept the Task");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::CompleteTask {
+                manifest: result_manifest(
+                    task_id,
+                    "implementation ready for review",
+                    attachment.id,
+                ),
+                native_turn_id: "native-turn-reviewing".to_owned(),
+            },
+        )
+        .await
+        .expect("structured Result must enter review");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::RecordTurnCompleted {
+                task_id,
+                native_turn_id: "native-turn-reviewing".to_owned(),
+                succeeded: true,
+            },
+        )
+        .await
+        .expect("terminal evidence must make the Result reviewable");
+    coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::RecordHostFailed {
+                diagnostic: "provider exited after Result admission".to_owned(),
+            },
+        )
+        .await
+        .expect("post-Result Host loss must settle safely");
+
+    assert_task_state(&coordinator, &supervisor, task_id, TaskState::Reviewing, 0).await;
+    let QueryResult::Holds(holds) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::ActiveHolds,
+        )
+        .await
+        .expect("mutating review must retain a Hold")
+    else {
+        panic!("Hold query must return Holds")
+    };
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].task_id, task_id);
+}
+
+#[tokio::test]
 #[expect(
     clippy::too_many_lines,
     reason = "end-to-end proof covers capture, Result delivery, Hold, and approval rejection"
@@ -1055,6 +1157,7 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
     assert_eq!(events[0].kind, SupervisorEventKind::BlockingQuestion);
     assert_eq!(events[0].state, SupervisorEventDeliveryState::Pending);
     let question_event_id = events[0].id;
+    let question_summary = events[0].summary.clone();
     let CommandOutcome::SupervisorEventClaimed { event: Some(event) } = coordinator
         .execute(
             ActorContext::Session {
@@ -1129,10 +1232,41 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
         )
         .await
         .expect("explicit reconciliation may make the event retryable");
-    let CommandOutcome::SupervisorEventClaimed { event: Some(event) } = coordinator
+    let QueryResult::SupervisorEvents(events) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::SupervisorEvents,
+        )
+        .await
+        .expect("reconciled event remains queryable")
+    else {
+        panic!("query must return Supervisor events")
+    };
+    assert_eq!(events[0].summary, question_summary);
+    let CommandOutcome::HostConnectionBound {
+        capability: supervisor_host,
+        ..
+    } = coordinator
         .execute(
             ActorContext::Session {
                 capability: supervisor.clone(),
+            },
+            CoordinatorCommand::BindHostConnection {
+                instance_id: "supervisor-host-test".to_owned(),
+                lease_seconds: 15,
+            },
+        )
+        .await
+        .expect("managed Supervisor Host must bind")
+    else {
+        panic!("Host bind must return a capability")
+    };
+    let CommandOutcome::SupervisorEventClaimed { event: Some(event) } = coordinator
+        .execute(
+            ActorContext::Host {
+                capability: supervisor_host.clone(),
             },
             CoordinatorCommand::ClaimNextSupervisorEvent,
         )
@@ -1144,17 +1278,45 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
     assert_eq!(event.id, question_event_id);
     coordinator
         .execute(
-            ActorContext::Session {
-                capability: supervisor.clone(),
+            ActorContext::Host {
+                capability: supervisor_host.clone(),
             },
             CoordinatorCommand::AcceptSupervisorEvent {
                 event_id: question_event_id,
                 native_correlation: question_event_id.to_string(),
+                native_turn_id: Some("omp-turn-1".to_owned()),
                 evidence: "OMP follow_up accepted".to_owned(),
             },
         )
         .await
         .expect("native acceptance must remain distinct from processing");
+    coordinator
+        .execute(
+            ActorContext::Host {
+                capability: supervisor_host,
+            },
+            CoordinatorCommand::RecordSupervisorEventPresentation {
+                event_id: question_event_id,
+                phase: herdr_harness_coordinator::core::SupervisorPresentationPhase::TurnStarted,
+                native_turn_id: Some("omp-turn-1".to_owned()),
+                evidence: "visible provider turn started".to_owned(),
+            },
+        )
+        .await
+        .expect("presentation evidence must append without processing the event");
+    let QueryResult::SupervisorEvents(events) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::SupervisorEvents,
+        )
+        .await
+        .expect("accepted event remains queryable")
+    else {
+        panic!("query must return Supervisor events")
+    };
+    assert_eq!(events[0].state, SupervisorEventDeliveryState::Accepted);
 
     let mut reply = message(
         "omp-worker",
@@ -1943,6 +2105,155 @@ async fn host_events_replay_idempotently_and_supervisor_can_stop_an_idle_worker(
         )
         .await
         .expect("idle Host stop completion");
+}
+
+#[tokio::test]
+async fn replacement_host_connection_fences_the_previous_generation() {
+    let (_state, coordinator, _supervisor, worker, _task_id) = seeded_task().await;
+    let CommandOutcome::HostConnectionBound {
+        capability: first,
+        generation: first_generation,
+        ..
+    } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::BindHostConnection {
+                instance_id: "worker-host-1".to_owned(),
+                lease_seconds: 15,
+            },
+        )
+        .await
+        .expect("first Host connection must bind")
+    else {
+        panic!("Host bind must return its capability")
+    };
+    let CommandOutcome::HostConnectionBound {
+        capability: second,
+        generation: second_generation,
+        ..
+    } = coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::BindHostConnection {
+                instance_id: "worker-host-2".to_owned(),
+                lease_seconds: 15,
+            },
+        )
+        .await
+        .expect("replacement Host connection must bind")
+    else {
+        panic!("replacement bind must return its capability")
+    };
+
+    assert_eq!(second_generation, first_generation + 1);
+    let error = coordinator
+        .query(
+            ActorContext::Host { capability: first },
+            CoordinatorQuery::SessionSelf,
+        )
+        .await
+        .expect_err("the superseded Host generation must be fenced");
+    assert_eq!(error.category, ErrorCategory::Unauthenticated);
+    assert!(matches!(
+        coordinator
+            .query(
+                ActorContext::Host {
+                    capability: second.clone(),
+                },
+                CoordinatorQuery::SessionSelf,
+            )
+            .await
+            .expect("the current Host generation remains authorized"),
+        QueryResult::Session(_)
+    ));
+    assert!(matches!(
+        coordinator
+            .execute(
+                ActorContext::Host { capability: second },
+                CoordinatorCommand::RenewHostConnection,
+            )
+            .await
+            .expect("the current Host lease renews"),
+        CommandOutcome::HostConnectionRenewed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn stale_supervisor_presence_lease_becomes_disconnected() {
+    let state = tempfile::tempdir().expect("state directory must exist");
+    let coordinator = Coordinator::open(state.path())
+        .await
+        .expect("Coordinator must open");
+    let CommandOutcome::SupervisorRegistered { capability, .. } = coordinator
+        .execute(
+            ActorContext::Bootstrap,
+            CoordinatorCommand::RegisterSupervisor {
+                definition: HarnessDefinitionV1 {
+                    schema_version: SCHEMA_VERSION,
+                    id: "supervisor".parse().expect("Harness ID"),
+                    kind: HarnessKind::Omp,
+                    tier: HarnessTier::Supervisor,
+                    cwd: state.path().to_path_buf(),
+                    launch_profile: None,
+                    model: None,
+                },
+            },
+        )
+        .await
+        .expect("Supervisor must register")
+    else {
+        panic!("registration must return a capability")
+    };
+    let CommandOutcome::HostConnectionBound {
+        capability: host, ..
+    } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: capability.clone(),
+            },
+            CoordinatorCommand::BindHostConnection {
+                instance_id: "supervisor-host".to_owned(),
+                lease_seconds: 1,
+            },
+        )
+        .await
+        .expect("Supervisor Host must bind")
+    else {
+        panic!("Host bind must return a capability")
+    };
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    assert!(matches!(
+        coordinator
+            .execute(
+                ActorContext::Bootstrap,
+                CoordinatorCommand::ReapStaleHostConnections,
+            )
+            .await
+            .expect("daemon reaper must settle the stale Host"),
+        CommandOutcome::StaleHostConnectionsReaped { count: 1 }
+    ));
+    let error = coordinator
+        .query(
+            ActorContext::Host { capability: host },
+            CoordinatorQuery::SessionSelf,
+        )
+        .await
+        .expect_err("expired Host capability must not authenticate");
+    assert_eq!(error.category, ErrorCategory::Unauthenticated);
+    let QueryResult::Session(session) = coordinator
+        .query(
+            ActorContext::Session { capability },
+            CoordinatorQuery::SessionSelf,
+        )
+        .await
+        .expect("durable Supervisor Session remains reconnectable")
+    else {
+        panic!("query must return the Supervisor Session")
+    };
+    assert_eq!(session.presence, "disconnected");
 }
 
 #[tokio::test]

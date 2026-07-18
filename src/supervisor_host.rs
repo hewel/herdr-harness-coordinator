@@ -19,10 +19,11 @@ use crate::{
         ResolvedDelivery, SupervisorAdapter, SupervisorAdapterEvent, SupervisorAdapterEventStream,
         SupervisorBindSpec, SupervisorSnapshot,
     },
-    contract::{HarnessKind, HarnessTier, ResultManifestV1, SupervisorEvent},
+    broker::{BrokerOperation, BrokerRequest, call_with_connect_retry},
+    contract::{HarnessKind, HarnessTier, ResultManifestV1, SCHEMA_VERSION, SupervisorEvent},
     core::{
-        ActorContext, CommandOutcome, Coordinator, CoordinatorCommand, CoordinatorQuery,
-        QueryResult, SessionCapability,
+        ActorContext, CommandOutcome, CoordinatorCommand, CoordinatorQuery,
+        HostConnectionCapability, QueryResult, SessionCapability,
     },
     process_adapter::{CodexProcessAdapter, OmpProcessAdapter},
 };
@@ -42,15 +43,8 @@ pub async fn run_managed_supervisor_host(
     capability_bearer: String,
 ) -> Result<()> {
     let capability = SessionCapability::from_bearer(capability_bearer)?;
-    let coordinator = Coordinator::open(state_dir).await?;
-    let QueryResult::Session(session) = coordinator
-        .query(
-            ActorContext::Session {
-                capability: capability.clone(),
-            },
-            CoordinatorQuery::SessionSelf,
-        )
-        .await?
+    let QueryResult::Session(session) =
+        broker_query(socket, capability.clone(), CoordinatorQuery::SessionSelf).await?
     else {
         bail!("Coordinator returned the wrong Supervisor Session projection")
     };
@@ -58,12 +52,27 @@ pub async fn run_managed_supervisor_host(
         bail!("managed Supervisor Host requires a Supervisor Session")
     }
     let executable = resolve_provider_executable(session.definition.kind)?;
+    let CommandOutcome::HostConnectionBound {
+        capability: host_capability,
+        ..
+    } = broker_execute(
+        socket,
+        capability,
+        CoordinatorCommand::BindHostConnection {
+            instance_id: format!("supervisor-host:{}", std::process::id()),
+            lease_seconds: 15,
+        },
+    )
+    .await?
+    else {
+        bail!("Coordinator returned the wrong Host connection outcome")
+    };
     let mut environment = inherited_supervisor_environment();
     environment.insert(
         "HERDR_HARNESS_CAPABILITY".to_owned(),
-        serde_json::to_value(&capability)?
+        serde_json::to_value(&host_capability)?
             .as_str()
-            .context("Supervisor capability did not serialize as text")?
+            .context("Supervisor Host capability did not serialize as text")?
             .to_owned(),
     );
     environment.insert(
@@ -81,6 +90,14 @@ pub async fn run_managed_supervisor_host(
     let native = adapter
         .bind(&SupervisorBindSpec {
             coordinator_session_id: session.session_id,
+            resume: if session.native_session_id.is_some() || session.native_thread_id.is_some() {
+                Some(crate::adapter::NativeSessionResume {
+                    session_id: session.native_session_id.clone(),
+                    thread_id: session.native_thread_id.clone(),
+                })
+            } else {
+                None
+            },
             executable,
             cwd: session.definition.cwd,
             provider_state_dir: state_dir
@@ -101,47 +118,45 @@ pub async fn run_managed_supervisor_host(
         })
         .await
         .context("binding native Supervisor Session")?;
-    coordinator
-        .execute(
-            ActorContext::Session {
-                capability: capability.clone(),
-            },
-            CoordinatorCommand::RecordSupervisorBinding {
-                native_session_id: native.native_session_id.clone(),
-                native_thread_id: native.thread_id.clone(),
-            },
-        )
-        .await?;
+    broker_execute(
+        socket,
+        host_capability.clone(),
+        CoordinatorCommand::RecordSupervisorBinding {
+            native_session_id: native.native_session_id.clone(),
+            native_thread_id: native.thread_id.clone(),
+        },
+    )
+    .await?;
     let snapshot = adapter
         .snapshot()
         .await
         .context("snapshotting bound Supervisor")?;
-    coordinator
-        .execute(
-            ActorContext::Session {
-                capability: capability.clone(),
+    broker_execute(
+        socket,
+        host_capability.clone(),
+        CoordinatorCommand::RecordAdapterSnapshot {
+            snapshot: crate::adapter::AdapterSnapshot {
+                lifecycle: snapshot.lifecycle,
+                session_id: snapshot.native_session_id,
+                thread_id: snapshot.thread_id,
+                active_turn_id: snapshot.active_turn_id,
+                steerable: snapshot.steerable,
+                queued_input_count: None,
+                model: session.definition.model,
+                native_health: snapshot.native_health,
+                context_tokens: None,
+                context_window: None,
+                context_percent: None,
+                compaction_count: None,
             },
-            CoordinatorCommand::RecordAdapterSnapshot {
-                snapshot: crate::adapter::AdapterSnapshot {
-                    lifecycle: snapshot.lifecycle,
-                    session_id: snapshot.native_session_id,
-                    thread_id: snapshot.thread_id,
-                    active_turn_id: snapshot.active_turn_id,
-                    steerable: snapshot.steerable,
-                    queued_input_count: None,
-                    model: session.definition.model,
-                    native_health: snapshot.native_health,
-                    context_tokens: None,
-                    context_window: None,
-                    context_percent: None,
-                    compaction_count: None,
-                },
-            },
-        )
-        .await?;
+        },
+    )
+    .await?;
     let mut events = adapter.events();
+    let mut accepted_event: Option<(crate::contract::SupervisorEventId, Option<String>)> = None;
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
     println!(
         "Managed {:?} Supervisor ready. Type a request and press Enter.",
         adapter.kind()
@@ -159,22 +174,28 @@ pub async fn run_managed_supervisor_host(
                     eprintln!("Supervisor prompt was not accepted: {error}");
                 }
             }
+            _ = heartbeat.tick() => {
+                broker_execute(
+                    socket,
+                    host_capability.clone(),
+                    CoordinatorCommand::RenewHostConnection,
+                ).await?;
+            }
             _ = ticker.tick() => {
                 let snapshot = adapter.snapshot().await.context("snapshotting Supervisor")?;
-                let may_claim = snapshot.lifecycle == AdapterLifecycle::Idle
-                    || (adapter.kind() == HarnessKind::Omp
-                        && snapshot.lifecycle == AdapterLifecycle::Working);
+                let may_claim = snapshot.lifecycle == AdapterLifecycle::Idle;
                 if !may_claim {
                     continue;
                 }
-                let outcome = coordinator.execute(
-                    ActorContext::Session { capability: capability.clone() },
+                let outcome = broker_execute(
+                    socket,
+                    host_capability.clone(),
                     CoordinatorCommand::ClaimNextSupervisorEvent,
                 ).await?;
                 let CommandOutcome::SupervisorEventClaimed { event: Some(event) } = outcome else {
                     continue;
                 };
-                let summary = enrich_event_summary(&coordinator, &capability, &event).await?;
+                let summary = enrich_event_summary(socket, &host_capability, &event).await?;
                 let durable = SupervisorEvent {
                     id: event.id,
                     kind: event.kind,
@@ -196,18 +217,23 @@ pub async fn run_managed_supervisor_host(
                 };
                 match acceptance {
                     Ok(acceptance) => {
-                        coordinator.execute(
-                            ActorContext::Session { capability: capability.clone() },
+                        let accepted_turn_id = acceptance.turn_id.clone();
+                        broker_execute(
+                            socket,
+                            host_capability.clone(),
                             CoordinatorCommand::AcceptSupervisorEvent {
                                 event_id: durable.id,
                                 native_correlation: acceptance.correlation,
+                                native_turn_id: acceptance.turn_id.clone(),
                                 evidence: acceptance.evidence,
                             },
                         ).await?;
+                        accepted_event = Some((durable.id, accepted_turn_id));
                     }
                     Err(error) if error.provider_bytes_may_have_been_written() => {
-                        coordinator.execute(
-                            ActorContext::Session { capability: capability.clone() },
+                        broker_execute(
+                            socket,
+                            host_capability.clone(),
                             CoordinatorCommand::MarkSupervisorEventUnknown {
                                 event_id: durable.id,
                                 diagnostic: error.to_string(),
@@ -215,8 +241,9 @@ pub async fn run_managed_supervisor_host(
                         ).await?;
                     }
                     Err(error) => {
-                        coordinator.execute(
-                            ActorContext::Session { capability: capability.clone() },
+                        broker_execute(
+                            socket,
+                            host_capability.clone(),
                             CoordinatorCommand::ReleaseSupervisorEvent {
                                 event_id: durable.id,
                                 diagnostic: error.to_string(),
@@ -227,6 +254,38 @@ pub async fn run_managed_supervisor_host(
             }
             event = events.next() => {
                 match event {
+                    Some(Ok(SupervisorAdapterEvent::TurnStarted { turn_id })) => {
+                        if let Some((event_id, expected_turn)) = &accepted_event
+                            && (expected_turn.is_none() || turn_id.is_none() || expected_turn == &turn_id)
+                        {
+                            broker_execute(
+                                socket,
+                                host_capability.clone(),
+                                CoordinatorCommand::RecordSupervisorEventPresentation {
+                                    event_id: *event_id,
+                                    phase: crate::core::SupervisorPresentationPhase::TurnStarted,
+                                    native_turn_id: turn_id,
+                                    evidence: "provider emitted normalized turn-start evidence for the accepted Coordinator event".to_owned(),
+                                },
+                            ).await?;
+                        }
+                    }
+                    Some(Ok(SupervisorAdapterEvent::TurnCompleted { turn_id, .. })) => {
+                        if let Some((event_id, expected_turn)) = &accepted_event
+                            && (expected_turn.is_none() || turn_id.is_none() || expected_turn == &turn_id)
+                        {
+                            broker_execute(
+                                socket,
+                                host_capability.clone(),
+                                CoordinatorCommand::RecordSupervisorEventPresentation {
+                                    event_id: *event_id,
+                                    phase: crate::core::SupervisorPresentationPhase::TurnCompleted,
+                                    native_turn_id: turn_id,
+                                    evidence: "provider emitted normalized turn-completion evidence for the accepted Coordinator event".to_owned(),
+                                },
+                            ).await?;
+                        }
+                    }
                     Some(Ok(SupervisorAdapterEvent::Transcript { text })) => println!("{text}"),
                     Some(Ok(SupervisorAdapterEvent::Activity { summary })) => eprintln!("{summary}"),
                     Some(Ok(SupervisorAdapterEvent::Failed { message })) => bail!("native Supervisor failed: {message}"),
@@ -242,12 +301,22 @@ pub async fn run_managed_supervisor_host(
     drop(events);
     adapter.stop().await.ok();
     let diagnostic = run_result.as_ref().err().map(ToString::to_string);
-    let disconnect_result = coordinator
-        .execute(
-            ActorContext::Session { capability },
-            CoordinatorCommand::RecordSupervisorDisconnected { diagnostic },
+    let disconnect_result = broker_execute(
+        socket,
+        host_capability.clone(),
+        CoordinatorCommand::RecordSupervisorDisconnected { diagnostic },
+    )
+    .await;
+    if disconnect_result.is_ok() {
+        let _ = broker_execute(
+            socket,
+            host_capability,
+            CoordinatorCommand::DisconnectHostConnection {
+                diagnostic: Some("managed Supervisor Host exited".to_owned()),
+            },
         )
         .await;
+    }
     match run_result {
         Ok(()) => {
             disconnect_result?;
@@ -258,21 +327,15 @@ pub async fn run_managed_supervisor_host(
 }
 
 async fn enrich_event_summary(
-    coordinator: &Coordinator,
-    capability: &SessionCapability,
+    socket: &Path,
+    capability: &HostConnectionCapability,
     event: &crate::core::SupervisorEventView,
 ) -> Result<String> {
     let Some(source_message_id) = event.source_message_id else {
         return Ok(event.summary.clone());
     };
-    let QueryResult::Inbox(messages) = coordinator
-        .query(
-            ActorContext::Session {
-                capability: capability.clone(),
-            },
-            CoordinatorQuery::Inbox,
-        )
-        .await?
+    let QueryResult::Inbox(messages) =
+        broker_query(socket, capability.clone(), CoordinatorQuery::Inbox).await?
     else {
         return Ok(event.summary.clone());
     };
@@ -326,6 +389,64 @@ async fn enrich_event_summary(
         verification,
         risks,
     ))
+}
+
+async fn broker_query<C>(
+    socket: &Path,
+    capability: C,
+    query: CoordinatorQuery,
+) -> Result<QueryResult>
+where
+    C: Into<ActorContext>,
+{
+    let response = call_with_connect_retry(
+        socket,
+        &BrokerRequest {
+            schema_version: SCHEMA_VERSION,
+            request_id: uuid::Uuid::now_v7().to_string(),
+            operation: BrokerOperation::Query {
+                actor: capability.into(),
+                query,
+            },
+        },
+        Duration::from_secs(10),
+    )
+    .await?;
+    decode_broker(response)
+}
+
+async fn broker_execute<C>(
+    socket: &Path,
+    capability: C,
+    command: CoordinatorCommand,
+) -> Result<CommandOutcome>
+where
+    C: Into<ActorContext>,
+{
+    let response = call_with_connect_retry(
+        socket,
+        &BrokerRequest {
+            schema_version: SCHEMA_VERSION,
+            request_id: uuid::Uuid::now_v7().to_string(),
+            operation: BrokerOperation::Execute {
+                actor: capability.into(),
+                command,
+            },
+        },
+        Duration::from_secs(10),
+    )
+    .await?;
+    decode_broker(response)
+}
+
+fn decode_broker<T: serde::de::DeserializeOwned>(
+    response: crate::broker::BrokerResponse,
+) -> Result<T> {
+    if let Some(error) = response.error {
+        bail!("broker {:?}: {}", error.category, error.message);
+    }
+    serde_json::from_value(response.result.context("broker response omitted result")?)
+        .context("decoding typed broker result")
 }
 
 fn inherited_supervisor_environment() -> BTreeMap<String, String> {
@@ -469,22 +590,24 @@ impl SupervisorAdapter for ProcessSupervisorAdapter {
     }
 
     async fn bind(&mut self, spec: &SupervisorBindSpec) -> AdapterResult<NativeSupervisorSession> {
-        let native = self
-            .adapter
-            .start(&HarnessStartSpec {
-                session_id: spec.coordinator_session_id,
-                tier: crate::contract::HarnessTier::Supervisor,
-                executable: spec.executable.clone(),
-                cwd: spec.cwd.clone(),
-                provider_state_dir: spec.provider_state_dir.clone(),
-                provider_profile: spec.provider_profile.clone(),
-                model: spec.model.clone(),
-                config_overlays: spec.config_overlays.clone(),
-                codex_approval_policy: spec.codex_approval_policy,
-                codex_sandbox_mode: spec.codex_sandbox_mode,
-                environment: spec.environment.clone(),
-            })
-            .await?;
+        let start_spec = HarnessStartSpec {
+            session_id: spec.coordinator_session_id,
+            tier: crate::contract::HarnessTier::Supervisor,
+            executable: spec.executable.clone(),
+            cwd: spec.cwd.clone(),
+            provider_state_dir: spec.provider_state_dir.clone(),
+            provider_profile: spec.provider_profile.clone(),
+            model: spec.model.clone(),
+            config_overlays: spec.config_overlays.clone(),
+            codex_approval_policy: spec.codex_approval_policy,
+            codex_sandbox_mode: spec.codex_sandbox_mode,
+            environment: spec.environment.clone(),
+        };
+        let native = if let Some(target) = &spec.resume {
+            self.adapter.resume(&start_spec, target).await?
+        } else {
+            self.adapter.start(&start_spec).await?
+        };
         let session = NativeSupervisorSession {
             coordinator_session_id: spec.coordinator_session_id,
             native_session_id: native.session_id,

@@ -91,10 +91,12 @@ pub struct BrokerErrorBody {
 #[derive(Debug, Error)]
 pub enum BrokerError {
     /// Unix socket operation failed.
-    #[error("broker socket `{path}` failed: {source}")]
+    #[error("broker socket `{path}` failed during {phase:?}: {source}")]
     Io {
         /// Socket path.
         path: PathBuf,
+        /// Transport phase that determines whether request bytes may have been written.
+        phase: BrokerIoPhase,
         /// Underlying I/O failure.
         source: io::Error,
     },
@@ -103,12 +105,38 @@ pub enum BrokerError {
     ResponseTooLarge,
 }
 
+/// Unix broker phase used to distinguish retry-safe connection failures from ambiguity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerIoPhase {
+    Bind,
+    Permissions,
+    Accept,
+    Connect,
+    Encode,
+    Write,
+    Read,
+    Decode,
+}
+
 impl BrokerError {
-    fn io(path: &Path, source: io::Error) -> Self {
+    fn io(path: &Path, phase: BrokerIoPhase, source: io::Error) -> Self {
         Self::Io {
             path: path.to_path_buf(),
+            phase,
             source,
         }
+    }
+
+    /// True only when the socket connection failed before request bytes could be written.
+    #[must_use]
+    pub fn is_retry_safe_connect(&self) -> bool {
+        matches!(
+            self,
+            Self::Io {
+                phase: BrokerIoPhase::Connect,
+                ..
+            }
+        )
     }
 }
 
@@ -133,13 +161,13 @@ impl BrokerServer {
         if let Some(parent) = socket_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|source| BrokerError::io(parent, source))?;
+                .map_err(|source| BrokerError::io(parent, BrokerIoPhase::Bind, source))?;
         }
         let listener = UnixListener::bind(&socket_path)
-            .map_err(|source| BrokerError::io(&socket_path, source))?;
+            .map_err(|source| BrokerError::io(&socket_path, BrokerIoPhase::Bind, source))?;
         tokio::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
             .await
-            .map_err(|source| BrokerError::io(&socket_path, source))?;
+            .map_err(|source| BrokerError::io(&socket_path, BrokerIoPhase::Permissions, source))?;
         Ok(Self {
             coordinator,
             listener,
@@ -155,11 +183,9 @@ impl BrokerServer {
     pub async fn serve(self) -> Result<(), BrokerError> {
         let mut clients = JoinSet::new();
         loop {
-            let (stream, _) = self
-                .listener
-                .accept()
-                .await
-                .map_err(|source| BrokerError::io(&self.socket_path, source))?;
+            let (stream, _) = self.listener.accept().await.map_err(|source| {
+                BrokerError::io(&self.socket_path, BrokerIoPhase::Accept, source)
+            })?;
             let coordinator = Arc::clone(&self.coordinator);
             clients.spawn(async move {
                 let _ = serve_connection(coordinator, stream).await;
@@ -180,10 +206,11 @@ pub async fn call(
 ) -> Result<BrokerResponse, BrokerError> {
     let mut stream = UnixStream::connect(socket_path)
         .await
-        .map_err(|source| BrokerError::io(socket_path, source))?;
+        .map_err(|source| BrokerError::io(socket_path, BrokerIoPhase::Connect, source))?;
     let mut frame = serde_json::to_vec(request).map_err(|source| {
         BrokerError::io(
             socket_path,
+            BrokerIoPhase::Encode,
             io::Error::new(io::ErrorKind::InvalidData, source),
         )
     })?;
@@ -194,22 +221,52 @@ pub async fn call(
     stream
         .write_all(&frame)
         .await
-        .map_err(|source| BrokerError::io(socket_path, source))?;
+        .map_err(|source| BrokerError::io(socket_path, BrokerIoPhase::Write, source))?;
     let mut reader = BufReader::new(stream);
     let mut response = Vec::new();
     reader
         .read_until(b'\n', &mut response)
         .await
-        .map_err(|source| BrokerError::io(socket_path, source))?;
+        .map_err(|source| BrokerError::io(socket_path, BrokerIoPhase::Read, source))?;
     if response.len() > MAX_BROKER_FRAME_BYTES {
         return Err(BrokerError::ResponseTooLarge);
     }
     serde_json::from_slice(&response).map_err(|source| {
         BrokerError::io(
             socket_path,
+            BrokerIoPhase::Decode,
             io::Error::new(io::ErrorKind::InvalidData, source),
         )
     })
+}
+
+/// Retries only provably unwritten socket-connect failures for a bounded handoff window.
+///
+/// Write, read, and decode failures are returned immediately because provider or Core effects may
+/// already exist and blind replay would violate delivery safety.
+///
+/// # Errors
+///
+/// Returns the final connect failure after `max_wait`, or any non-connect transport failure
+/// immediately without replaying the request.
+pub async fn call_with_connect_retry(
+    socket_path: &Path,
+    request: &BrokerRequest,
+    max_wait: std::time::Duration,
+) -> Result<BrokerResponse, BrokerError> {
+    let started = tokio::time::Instant::now();
+    loop {
+        match call(socket_path, request).await {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if error.is_retry_safe_connect()
+                    && tokio::time::Instant::now().duration_since(started) < max_wait =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn serve_connection(coordinator: Arc<Coordinator>, stream: UnixStream) -> io::Result<()> {

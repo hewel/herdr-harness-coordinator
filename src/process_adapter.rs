@@ -23,9 +23,9 @@ use crate::{
     adapter::{
         AdapterCapabilities, AdapterError, AdapterEvent, AdapterEventStream, AdapterLifecycle,
         AdapterResult, AdapterSnapshot, CodexFrame, HarnessAdapter, HarnessStartSpec,
-        NativeAcceptance, NativeDeliveryKind, NativeSession, NativeTurnStatus, OmpFrame,
-        ResolvedDelivery, WorkerCompletionTools, classify_codex_frame, classify_omp_frame,
-        validate_codex_version_output, validate_omp_version_output,
+        NativeAcceptance, NativeDeliveryKind, NativeSession, NativeSessionResume, NativeTurnStatus,
+        OmpFrame, ResolvedDelivery, WorkerCompletionTools, classify_codex_frame,
+        classify_omp_frame, validate_codex_version_output, validate_omp_version_output,
     },
     contract::{HarnessKind, NativeSessionHealth},
     mcp::{self, McpServer},
@@ -148,6 +148,24 @@ impl ProcessAdapter {
         }
     }
 
+    async fn compatibility_request(
+        &mut self,
+        kind: HarnessKind,
+        payload: Value,
+        id: String,
+    ) -> AdapterResult<Option<Value>> {
+        match self.request(kind, payload, id).await {
+            Ok(value) => Ok(Some(value)),
+            Err(AdapterError::DeliveryAmbiguous { message, .. })
+                if is_method_not_found(&message) =>
+            {
+                Ok(None)
+            }
+            Err(AdapterError::DeliveryAmbiguous { message, .. }) => Err(operation(kind, message)),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn stop(&mut self, kind: HarnessKind) -> AdapterResult<()> {
         let Some(mut runtime) = self.runtime.take() else {
             return Ok(());
@@ -224,55 +242,16 @@ impl OmpProcessAdapter {
     pub fn with_timeouts(self, start: Duration, request: Duration, stop: Duration) -> Self {
         Self(self.0.with_timeouts(start, request, stop))
     }
-}
 
-/// Process-backed Adapter for runtime-verified Codex App Server releases.
-pub struct CodexProcessAdapter(ProcessAdapter);
-
-impl Default for CodexProcessAdapter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CodexProcessAdapter {
-    /// Creates an Adapter with the contract default timeouts.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(ProcessAdapter::new())
-    }
-
-    /// Overrides process timeouts, primarily for compatibility fixtures.
-    #[must_use]
-    pub fn with_timeouts(self, start: Duration, request: Duration, stop: Duration) -> Self {
-        Self(self.0.with_timeouts(start, request, stop))
-    }
-}
-
-#[async_trait]
-impl HarnessAdapter for OmpProcessAdapter {
-    fn kind(&self) -> HarnessKind {
-        HarnessKind::Omp
-    }
-
-    fn capabilities(&self) -> AdapterCapabilities {
-        AdapterCapabilities {
-            persistent_session: true,
-            active_turn_steering: true,
-            active_turn_follow_up: true,
-            cooperative_cancellation: true,
-            safe_compaction: true,
-        }
-    }
-
-    fn completion_tools(&self) -> WorkerCompletionTools {
-        WorkerCompletionTools {
-            attachment_create: "harness_attachment_create",
-            complete: "harness_complete",
-        }
-    }
-
-    async fn start(&mut self, spec: &HarnessStartSpec) -> AdapterResult<NativeSession> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "OMP startup keeps the ordered native handshake and resume identity proof together"
+    )]
+    async fn start_session(
+        &mut self,
+        spec: &HarnessStartSpec,
+        resume_session_id: Option<&str>,
+    ) -> AdapterResult<NativeSession> {
         ensure_fresh(HarnessKind::Omp, self.0.runtime.as_ref())?;
         let observed_version = version(HarnessKind::Omp, &spec.executable).await?;
         tokio::fs::create_dir_all(&spec.provider_state_dir)
@@ -288,6 +267,9 @@ impl HarnessAdapter for OmpProcessAdapter {
         }
         if let Some(model) = &spec.model {
             command.arg("--model").arg(model);
+        }
+        if let Some(session_id) = resume_session_id {
+            command.arg("--resume").arg(session_id);
         }
         command
             .args(["--mode", "rpc", "--cwd"])
@@ -337,9 +319,21 @@ impl HarnessAdapter for OmpProcessAdapter {
             .0
             .request(HarnessKind::Omp, json!({"type": "get_state"}), id)
             .await?;
+        let session_id = field(&value, "sessionId");
+        if let Some(expected) = resume_session_id
+            && session_id.as_deref() != Some(expected)
+        {
+            return Err(operation(
+                HarnessKind::Omp,
+                format!(
+                    "resumed Session identity mismatch: expected `{expected}`, observed `{}`",
+                    session_id.as_deref().unwrap_or("missing")
+                ),
+            ));
+        }
         let native = NativeSession {
             observed_version,
-            session_id: field(&value, "sessionId"),
+            session_id,
             thread_id: None,
             cwd: spec.cwd.clone(),
             model: compatible_omp_model(spec.model.as_deref(), model(&value)),
@@ -357,6 +351,226 @@ impl HarnessAdapter for OmpProcessAdapter {
         )
         .await;
         Ok(native)
+    }
+}
+
+/// Process-backed Adapter for runtime-verified Codex App Server releases.
+pub struct CodexProcessAdapter(ProcessAdapter);
+
+impl Default for CodexProcessAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CodexProcessAdapter {
+    /// Creates an Adapter with the contract default timeouts.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(ProcessAdapter::new())
+    }
+
+    /// Overrides process timeouts, primarily for compatibility fixtures.
+    #[must_use]
+    pub fn with_timeouts(self, start: Duration, request: Duration, stop: Duration) -> Self {
+        Self(self.0.with_timeouts(start, request, stop))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Codex startup keeps the ordered native handshake and policy evidence together"
+    )]
+    async fn start_session(
+        &mut self,
+        spec: &HarnessStartSpec,
+        resume_thread_id: Option<&str>,
+    ) -> AdapterResult<NativeSession> {
+        ensure_fresh(HarnessKind::Codex, self.0.runtime.as_ref())?;
+        let observed_version = version(HarnessKind::Codex, &spec.executable).await?;
+        tokio::fs::create_dir_all(&spec.provider_state_dir)
+            .await
+            .map_err(|error| operation(HarnessKind::Codex, error.to_string()))?;
+        let mut command = Command::new(&spec.executable);
+        if spec.provider_profile.is_some() {
+            return Err(operation(
+                HarnessKind::Codex,
+                "Codex App Server does not accept CLI profiles; use a v3 launch profile with explicit approval_policy and sandbox_mode",
+            ));
+        }
+        let coordinator = std::env::current_exe().map_err(|error| {
+            operation(
+                HarnessKind::Codex,
+                format!("cannot resolve Coordinator MCP executable: {error}"),
+            )
+        })?;
+        let command_value = serde_json::to_string(&coordinator.to_string_lossy())
+            .map_err(|error| operation(HarnessKind::Codex, error.to_string()))?;
+        command
+            .arg("-c")
+            .arg(format!("mcp_servers.herdr.command={command_value}"))
+            .arg("-c")
+            .arg("mcp_servers.herdr.args=[\"mcp\"]");
+        command.args(["app-server", "--listen", "stdio://", "--strict-config"]);
+        let (mut child, stdin, stdout) = spawn(&mut command, spec, HarnessKind::Codex)?;
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let stdin = Arc::new(Mutex::new(stdin));
+        codex_reader(
+            BufReader::new(stdout).lines(),
+            Arc::clone(&pending),
+            Arc::clone(&self.0.state),
+            self.0.event_tx.clone(),
+        );
+        drain_stderr(child.stderr.take());
+        self.0.runtime = Some(Runtime {
+            child,
+            stdin: Some(stdin),
+            pending,
+        });
+        let id = self.0.id();
+        timeout(
+            self.0.start_timeout,
+            self.0.request(
+                HarnessKind::Codex,
+                json!({"method":"initialize","params":{"clientInfo":{"name":"herdr_harness_coordinator","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}}),
+                id,
+            ),
+        )
+        .await
+        .map_err(|_| operation(HarnessKind::Codex, "initialize timed out"))??;
+        write_line(
+            HarnessKind::Codex,
+            self.0
+                .runtime
+                .as_mut()
+                .and_then(|runtime| runtime.stdin.as_ref()),
+            &json!({"method":"initialized"}),
+        )
+        .await?;
+        let approval_policy = spec.codex_approval_policy.ok_or_else(|| {
+            operation(
+                HarnessKind::Codex,
+                "Codex App Server requires a v3 launch profile with approval_policy",
+            )
+        })?;
+        let sandbox = spec.codex_sandbox_mode.ok_or_else(|| {
+            operation(
+                HarnessKind::Codex,
+                "Codex App Server requires a v3 launch profile with sandbox_mode",
+            )
+        })?;
+        let (method, params) = resume_thread_id.map_or_else(
+            || {
+                (
+                    "thread/start",
+                    json!({
+                        "cwd":spec.cwd,
+                        "model":spec.model,
+                        "ephemeral":false,
+                        "approvalPolicy":approval_policy,
+                        "sandbox":sandbox
+                    }),
+                )
+            },
+            |thread_id| {
+                (
+                    "thread/resume",
+                    json!({
+                        "threadId":thread_id,
+                        "cwd":spec.cwd,
+                        "model":spec.model,
+                        "approvalPolicy":approval_policy,
+                        "sandbox":sandbox,
+                        "excludeTurns":true
+                    }),
+                )
+            },
+        );
+        let id = self.0.id();
+        let value = self
+            .0
+            .request(
+                HarnessKind::Codex,
+                json!({"method":method,"params":params}),
+                id,
+            )
+            .await?;
+        let thread = value.get("thread").unwrap_or(&value);
+        let thread_id = field(thread, "id")
+            .ok_or_else(|| operation(HarnessKind::Codex, format!("{method} omitted thread id")))?;
+        if let Some(expected) = resume_thread_id
+            && thread_id != expected
+        {
+            return Err(operation(
+                HarnessKind::Codex,
+                format!(
+                    "resumed thread identity mismatch: expected `{expected}`, observed `{thread_id}`"
+                ),
+            ));
+        }
+        verify_codex_mcp_readiness(&mut self.0, spec.tier, &thread_id).await?;
+        let native = NativeSession {
+            observed_version,
+            session_id: field(thread, "sessionId"),
+            thread_id: Some(thread_id),
+            cwd: field(&value, "cwd")
+                .or_else(|| field(thread, "cwd"))
+                .map_or_else(|| spec.cwd.clone(), Into::into),
+            model: field(&value, "model")
+                .or_else(|| field(thread, "model"))
+                .or_else(|| spec.model.clone()),
+        };
+        {
+            let mut state = self.0.state.lock().await;
+            state.lifecycle = AdapterLifecycle::Idle;
+            state.session_id.clone_from(&native.session_id);
+            state.thread_id.clone_from(&native.thread_id);
+            state.model.clone_from(&native.model);
+        }
+        emit(
+            &self.0.event_tx,
+            AdapterEvent::SessionStarted(native.clone()),
+        )
+        .await;
+        Ok(native)
+    }
+}
+
+#[async_trait]
+impl HarnessAdapter for OmpProcessAdapter {
+    fn kind(&self) -> HarnessKind {
+        HarnessKind::Omp
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            persistent_session: true,
+            active_turn_steering: true,
+            active_turn_follow_up: true,
+            cooperative_cancellation: true,
+            safe_compaction: true,
+        }
+    }
+
+    fn completion_tools(&self) -> WorkerCompletionTools {
+        WorkerCompletionTools {
+            attachment_create: "harness_attachment_create",
+            complete: "harness_complete",
+        }
+    }
+
+    async fn start(&mut self, spec: &HarnessStartSpec) -> AdapterResult<NativeSession> {
+        self.start_session(spec, None).await
+    }
+
+    async fn resume(
+        &mut self,
+        spec: &HarnessStartSpec,
+        target: &NativeSessionResume,
+    ) -> AdapterResult<NativeSession> {
+        let session_id = target.session_id.as_deref().ok_or_else(|| {
+            operation(HarnessKind::Omp, "OMP resume requires a native Session ID")
+        })?;
+        self.start_session(spec, Some(session_id)).await
     }
 
     async fn dispatch(&mut self, delivery: ResolvedDelivery) -> AdapterResult<NativeAcceptance> {
@@ -476,6 +690,79 @@ fn selected_omp_alias(model: &str) -> &str {
         .unwrap_or(model)
 }
 
+async fn verify_codex_mcp_readiness(
+    adapter: &mut ProcessAdapter,
+    tier: crate::contract::HarnessTier,
+    thread_id: &str,
+) -> AdapterResult<()> {
+    let id = adapter.id();
+    let Some(status) = adapter
+        .compatibility_request(
+            HarnessKind::Codex,
+            json!({"method":"mcpServerStatus/list","params":{
+                "detail":"toolsAndAuthOnly",
+                "threadId":thread_id
+            }}),
+            id,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let servers = status
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| operation(HarnessKind::Codex, "MCP status omitted data"))?;
+    let tools = servers
+        .iter()
+        .find(|server| field(server, "name").as_deref() == Some("herdr"))
+        .and_then(|server| server.get("tools"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| operation(HarnessKind::Codex, "herdr MCP server is not ready"))?;
+    let required: &[&str] = match tier {
+        crate::contract::HarnessTier::Worker => &[
+            "harness_list",
+            "harness_status",
+            "harness_inbox",
+            "harness_request",
+            "harness_send",
+            "harness_complete",
+            "harness_attachment_create",
+        ],
+        crate::contract::HarnessTier::Supervisor => &[
+            "harness_status",
+            "harness_inbox",
+            "harness_supervisor_events",
+            "harness_start",
+            "harness_task_create",
+            "harness_task_approve",
+            "harness_supervisor_event_ack",
+        ],
+    };
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|name| !tools.contains_key(*name))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(operation(
+            HarnessKind::Codex,
+            format!(
+                "herdr MCP server is not ready; missing tools: {}",
+                missing.join(", ")
+            ),
+        ))
+    }
+}
+
+fn is_method_not_found(message: &str) -> bool {
+    message.contains("\"code\":-32601")
+        || message.contains("\"code\": -32601")
+        || message.to_ascii_lowercase().contains("method not found")
+}
+
 #[async_trait]
 impl HarnessAdapter for CodexProcessAdapter {
     fn kind(&self) -> HarnessKind {
@@ -499,122 +786,22 @@ impl HarnessAdapter for CodexProcessAdapter {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Codex startup keeps the ordered native handshake and policy evidence together"
-    )]
     async fn start(&mut self, spec: &HarnessStartSpec) -> AdapterResult<NativeSession> {
-        ensure_fresh(HarnessKind::Codex, self.0.runtime.as_ref())?;
-        let observed_version = version(HarnessKind::Codex, &spec.executable).await?;
-        tokio::fs::create_dir_all(&spec.provider_state_dir)
-            .await
-            .map_err(|error| operation(HarnessKind::Codex, error.to_string()))?;
-        let mut command = Command::new(&spec.executable);
-        if spec.provider_profile.is_some() {
-            return Err(operation(
-                HarnessKind::Codex,
-                "Codex App Server does not accept CLI profiles; use a v3 launch profile with explicit approval_policy and sandbox_mode",
-            ));
-        }
-        let coordinator = std::env::current_exe().map_err(|error| {
+        self.start_session(spec, None).await
+    }
+
+    async fn resume(
+        &mut self,
+        spec: &HarnessStartSpec,
+        target: &NativeSessionResume,
+    ) -> AdapterResult<NativeSession> {
+        let thread_id = target.thread_id.as_deref().ok_or_else(|| {
             operation(
                 HarnessKind::Codex,
-                format!("cannot resolve Coordinator MCP executable: {error}"),
+                "Codex resume requires a native thread ID",
             )
         })?;
-        let command_value = serde_json::to_string(&coordinator.to_string_lossy())
-            .map_err(|error| operation(HarnessKind::Codex, error.to_string()))?;
-        command
-            .arg("-c")
-            .arg(format!("mcp_servers.herdr.command={command_value}"))
-            .arg("-c")
-            .arg("mcp_servers.herdr.args=[\"mcp\"]");
-        command.args(["app-server", "--listen", "stdio://", "--strict-config"]);
-        let (mut child, stdin, stdout) = spawn(&mut command, spec, HarnessKind::Codex)?;
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let stdin = Arc::new(Mutex::new(stdin));
-        codex_reader(
-            BufReader::new(stdout).lines(),
-            Arc::clone(&pending),
-            Arc::clone(&self.0.state),
-            self.0.event_tx.clone(),
-        );
-        drain_stderr(child.stderr.take());
-        self.0.runtime = Some(Runtime {
-            child,
-            stdin: Some(stdin),
-            pending,
-        });
-        let id = self.0.id();
-        timeout(
-            self.0.start_timeout,
-            self.0.request(
-                HarnessKind::Codex,
-                json!({"method":"initialize","params":{"clientInfo":{"name":"herdr_harness_coordinator","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}}),
-                id,
-            ),
-        )
-        .await
-        .map_err(|_| operation(HarnessKind::Codex, "initialize timed out"))??;
-        write_line(
-            HarnessKind::Codex,
-            self.0
-                .runtime
-                .as_mut()
-                .and_then(|runtime| runtime.stdin.as_ref()),
-            &json!({"method":"initialized"}),
-        )
-        .await?;
-        let id = self.0.id();
-        let approval_policy = spec.codex_approval_policy.ok_or_else(|| {
-            operation(
-                HarnessKind::Codex,
-                "Codex App Server requires a v3 launch profile with approval_policy",
-            )
-        })?;
-        let sandbox = spec.codex_sandbox_mode.ok_or_else(|| {
-            operation(
-                HarnessKind::Codex,
-                "Codex App Server requires a v3 launch profile with sandbox_mode",
-            )
-        })?;
-        let value = self
-            .0
-            .request(
-                HarnessKind::Codex,
-                json!({"method":"thread/start","params":{
-                    "cwd":spec.cwd,
-                    "model":spec.model,
-                    "ephemeral":false,
-                    "approvalPolicy":approval_policy,
-                    "sandbox":sandbox
-                }}),
-                id,
-            )
-            .await?;
-        let thread = value.get("thread").unwrap_or(&value);
-        let thread_id = field(thread, "id")
-            .ok_or_else(|| operation(HarnessKind::Codex, "thread/start omitted thread id"))?;
-        let native = NativeSession {
-            observed_version,
-            session_id: field(thread, "sessionId"),
-            thread_id: Some(thread_id),
-            cwd: field(thread, "cwd").map_or_else(|| spec.cwd.clone(), Into::into),
-            model: field(thread, "model").or_else(|| spec.model.clone()),
-        };
-        {
-            let mut state = self.0.state.lock().await;
-            state.lifecycle = AdapterLifecycle::Idle;
-            state.session_id.clone_from(&native.session_id);
-            state.thread_id.clone_from(&native.thread_id);
-            state.model.clone_from(&native.model);
-        }
-        emit(
-            &self.0.event_tx,
-            AdapterEvent::SessionStarted(native.clone()),
-        )
-        .await;
-        Ok(native)
+        self.start_session(spec, Some(thread_id)).await
     }
 
     async fn dispatch(&mut self, delivery: ResolvedDelivery) -> AdapterResult<NativeAcceptance> {

@@ -28,6 +28,7 @@ use herdr_harness_coordinator::{
     herdr::{HerdrSocketClient, PluginPaneOpenParams},
     mcp::McpServer,
 };
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Debug, Parser)]
@@ -184,6 +185,13 @@ enum WorkspaceStateArg {
 enum HarnessKindArg {
     Omp,
     Codex,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedSupervisorRuntime {
+    session_socket: PathBuf,
+    workspace_id: String,
+    environment: std::collections::BTreeMap<String, String>,
 }
 
 #[tokio::main]
@@ -415,6 +423,27 @@ async fn activate_workspace(
         capability
     };
     let socket = workspace_socket(&view.state_dir)?;
+    let mut supervisor_environment = std::collections::BTreeMap::new();
+    if let Some(policy) = selection.supervisor.codex_approval_policy {
+        supervisor_environment.insert(
+            "HERDR_CODEX_APPROVAL_POLICY".to_owned(),
+            codex_approval_policy_name(policy).to_owned(),
+        );
+    }
+    if let Some(mode) = selection.supervisor.codex_sandbox_mode {
+        supervisor_environment.insert(
+            "HERDR_CODEX_SANDBOX_MODE".to_owned(),
+            codex_sandbox_mode_name(mode).to_owned(),
+        );
+    }
+    write_private_json(
+        &view.state_dir.join("managed-supervisor.json"),
+        &ManagedSupervisorRuntime {
+            session_socket: identity.session_socket().to_path_buf(),
+            workspace_id: view.workspace_id.clone(),
+            environment: supervisor_environment.clone(),
+        },
+    )?;
     if !socket_is_live(&socket).await {
         remove_file_if_present(&socket).await?;
         let executable = std::env::current_exe().context("resolving Coordinator executable")?;
@@ -469,18 +498,7 @@ async fn activate_workspace(
             "HERDR_COORDINATOR_BIN".to_owned(),
             std::env::current_exe()?.to_string_lossy().into_owned(),
         );
-        if let Some(policy) = selection.supervisor.codex_approval_policy {
-            pane.env.insert(
-                "HERDR_CODEX_APPROVAL_POLICY".to_owned(),
-                codex_approval_policy_name(policy).to_owned(),
-            );
-        }
-        if let Some(mode) = selection.supervisor.codex_sandbox_mode {
-            pane.env.insert(
-                "HERDR_CODEX_SANDBOX_MODE".to_owned(),
-                codex_sandbox_mode_name(mode).to_owned(),
-            );
-        }
+        pane.env.extend(supervisor_environment);
         HerdrSocketClient::new(identity.session_socket().to_path_buf())
             .open_worker(pane)
             .await
@@ -598,6 +616,23 @@ fn write_capability(path: &Path, capability: &SessionCapability) -> Result<()> {
     let permissions = file.metadata()?.permissions();
     if permissions.mode() & 0o077 != 0 {
         bail!("Supervisor capability permissions are not private")
+    }
+    Ok(())
+}
+
+fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    serde_json::to_writer(&mut file, value)
+        .with_context(|| format!("encoding {}", path.display()))?;
+    let permissions = file.metadata()?.permissions();
+    if permissions.mode() & 0o077 != 0 {
+        bail!("managed Supervisor runtime permissions are not private")
     }
     Ok(())
 }
@@ -836,10 +871,35 @@ fn print_activation(
 async fn run_daemon(state_dir: PathBuf, socket: Option<PathBuf>) -> Result<()> {
     let coordinator = Arc::new(Coordinator::open(&state_dir).await?);
     let socket = socket.unwrap_or_else(|| state_dir.join("coordinator.sock"));
-    let server = BrokerServer::bind(coordinator, &socket).await?;
-    let result = tokio::select! {
-        result = server.serve() => result.map_err(anyhow::Error::from),
-        signal = tokio::signal::ctrl_c() => signal.context("waiting for shutdown signal"),
+    let server = BrokerServer::bind(Arc::clone(&coordinator), &socket).await?;
+    let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut last_supervisor_reopen =
+        tokio::time::Instant::now() - std::time::Duration::from_secs(10);
+    let server_task = server.serve();
+    tokio::pin!(server_task);
+    let result = loop {
+        tokio::select! {
+            result = &mut server_task => break result.map_err(anyhow::Error::from),
+            signal = tokio::signal::ctrl_c() => break signal.context("waiting for shutdown signal"),
+            _ = maintenance.tick() => {
+                if let Err(error) = coordinator.execute(
+                    ActorContext::Bootstrap,
+                    CoordinatorCommand::ReapStaleHostConnections,
+                ).await {
+                    tracing::error!(%error, "failed to reap stale Host presence leases");
+                }
+                if last_supervisor_reopen.elapsed() >= std::time::Duration::from_secs(10) {
+                    match reopen_disconnected_supervisor(&coordinator, &state_dir, &socket).await {
+                        Ok(true) => last_supervisor_reopen = tokio::time::Instant::now(),
+                        Ok(false) => {}
+                        Err(error) => {
+                            last_supervisor_reopen = tokio::time::Instant::now();
+                            tracing::error!(%error, "failed to reopen disconnected managed Supervisor");
+                        }
+                    }
+                }
+            }
+        }
     };
     if let Err(error) = tokio::fs::remove_file(&socket).await
         && error.kind() != std::io::ErrorKind::NotFound
@@ -847,6 +907,66 @@ async fn run_daemon(state_dir: PathBuf, socket: Option<PathBuf>) -> Result<()> {
         tracing::warn!(%error, path = %socket.display(), "failed to remove owned broker socket");
     }
     result
+}
+
+async fn reopen_disconnected_supervisor(
+    coordinator: &Coordinator,
+    state_dir: &Path,
+    socket: &Path,
+) -> Result<bool> {
+    let runtime_path = state_dir.join("managed-supervisor.json");
+    let capability_path = state_dir.join("supervisor.capability");
+    if !runtime_path.is_file() || !capability_path.is_file() {
+        return Ok(false);
+    }
+    let runtime: ManagedSupervisorRuntime = serde_json::from_slice(
+        &tokio::fs::read(&runtime_path)
+            .await
+            .with_context(|| format!("reading {}", runtime_path.display()))?,
+    )?;
+    let bearer = tokio::fs::read_to_string(&capability_path).await?;
+    let capability = SessionCapability::from_bearer(bearer.trim().to_owned())?;
+    let QueryResult::Session(session) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: capability.clone(),
+            },
+            CoordinatorQuery::SessionSelf,
+        )
+        .await?
+    else {
+        bail!("Coordinator returned the wrong Supervisor Session projection")
+    };
+    if session.presence != "disconnected" {
+        return Ok(false);
+    }
+    let bearer = serde_json::to_value(&capability)?
+        .as_str()
+        .context("Supervisor capability did not serialize as text")?
+        .to_owned();
+    let mut pane = PluginPaneOpenParams::supervisor(
+        &bearer,
+        &session.definition.cwd,
+        Some(runtime.workspace_id),
+    );
+    pane.env.insert(
+        "HERDR_COORDINATOR_STATE_DIR".to_owned(),
+        state_dir.to_string_lossy().into_owned(),
+    );
+    pane.env.insert(
+        "HERDR_COORDINATOR_SOCKET".to_owned(),
+        socket.to_string_lossy().into_owned(),
+    );
+    pane.env.insert(
+        "HERDR_COORDINATOR_BIN".to_owned(),
+        std::env::current_exe()?.to_string_lossy().into_owned(),
+    );
+    pane.env.extend(runtime.environment);
+    HerdrSocketClient::new(runtime.session_socket)
+        .open_worker(pane)
+        .await
+        .context("reopening managed Supervisor pane after presence expiry")?;
+    Ok(true)
 }
 
 async fn run_call(socket: PathBuf) -> Result<()> {

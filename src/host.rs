@@ -14,15 +14,15 @@ use crate::{
         ResolvedDelivery, WorkerCompletionTools,
     },
     attachment::AttachmentStore,
-    broker::{BrokerOperation, BrokerRequest, call},
+    broker::{BrokerOperation, BrokerRequest, call_with_connect_retry},
     contract::{
         DeliveryIntent, HarnessKind, HarnessTier, MessageSubmissionV1, SCHEMA_VERSION,
         TaskSubmissionV1,
     },
     core::{
         ActorContext, CommandOutcome, CoordinatorCommand, CoordinatorQuery,
-        HarnessCompatibilityEvidenceV1, InboxMessageView, QueryResult, SessionCapability,
-        TaskState,
+        HarnessCompatibilityEvidenceV1, HostConnectionCapability, InboxMessageView, QueryResult,
+        SessionCapability, TaskState,
     },
     process_adapter::{CodexProcessAdapter, OmpProcessAdapter},
     profile::{parse_launch_profile_snapshot, resolve_executable},
@@ -99,11 +99,30 @@ async fn run_worker_host_inner(
                 .map(|value| (name.clone(), value.clone()))
         })
         .collect::<BTreeMap<_, _>>();
+    crate::mcp::verify_required_worker_tools(socket, capability.clone())
+        .await
+        .context("verifying required Coordinator tools")?;
+    let CommandOutcome::HostConnectionBound {
+        capability: host_capability,
+        ..
+    } = broker_execute(
+        socket,
+        capability,
+        CoordinatorCommand::BindHostConnection {
+            instance_id: format!("worker-host:{}", std::process::id()),
+            lease_seconds: 15,
+        },
+    )
+    .await?
+    else {
+        bail!("Coordinator returned the wrong Host connection outcome")
+    };
+    let capability = host_capability;
     environment.insert(
         "HERDR_HARNESS_CAPABILITY".to_owned(),
         serde_json::to_value(&capability)?
             .as_str()
-            .context("Session capability did not serialize as a bearer")?
+            .context("Host connection capability did not serialize as a bearer")?
             .to_owned(),
     );
     environment.insert(
@@ -132,9 +151,6 @@ async fn run_worker_host_inner(
     tokio::fs::create_dir_all(&spec.provider_state_dir)
         .await
         .context("creating provider Session state directory")?;
-    crate::mcp::verify_required_worker_tools(socket, capability.clone())
-        .await
-        .context("verifying required Coordinator tools")?;
     let mut adapter: Box<dyn HarnessAdapter> = match profile.kind {
         HarnessKind::Omp => Box::new(OmpProcessAdapter::new()),
         HarnessKind::Codex => Box::new(CodexProcessAdapter::new()),
@@ -198,8 +214,16 @@ async fn run_worker_host_inner(
     let mut cancellation_started = None;
     let mut event_sequence = session.event_sequence;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                broker_execute(
+                    socket,
+                    capability.clone(),
+                    CoordinatorCommand::RenewHostConnection,
+                ).await?;
+            }
             _ = ticker.tick() => {
                 if current_task.is_none() {
                     let snapshot = adapter.snapshot().await.context("refreshing native Harness snapshot")?;
@@ -700,7 +724,7 @@ async fn resolve_delivery(
     adapter: &mut dyn HarnessAdapter,
     socket: &Path,
     state_dir: &Path,
-    capability: SessionCapability,
+    capability: HostConnectionCapability,
     message: &InboxMessageView,
     task_id: Option<crate::contract::TaskId>,
 ) -> Result<Option<ResolvedDelivery>> {
@@ -817,41 +841,49 @@ async fn dispatch_with_safe_retries(
     Err(last.expect("at least one retry attempt"))
 }
 
-async fn broker_query(
+async fn broker_query<C>(
     socket: &Path,
-    capability: SessionCapability,
+    capability: C,
     query: CoordinatorQuery,
-) -> Result<QueryResult> {
-    let response = call(
+) -> Result<QueryResult>
+where
+    C: Into<ActorContext>,
+{
+    let response = call_with_connect_retry(
         socket,
         &BrokerRequest {
             schema_version: SCHEMA_VERSION,
             request_id: uuid::Uuid::now_v7().to_string(),
             operation: BrokerOperation::Query {
-                actor: ActorContext::Session { capability },
+                actor: capability.into(),
                 query,
             },
         },
+        Duration::from_secs(10),
     )
     .await?;
     decode_result(response)
 }
 
-async fn broker_execute(
+async fn broker_execute<C>(
     socket: &Path,
-    capability: SessionCapability,
+    capability: C,
     command: CoordinatorCommand,
-) -> Result<CommandOutcome> {
-    let response = call(
+) -> Result<CommandOutcome>
+where
+    C: Into<ActorContext>,
+{
+    let response = call_with_connect_retry(
         socket,
         &BrokerRequest {
             schema_version: SCHEMA_VERSION,
             request_id: uuid::Uuid::now_v7().to_string(),
             operation: BrokerOperation::Execute {
-                actor: ActorContext::Session { capability },
+                actor: capability.into(),
                 command,
             },
         },
+        Duration::from_secs(10),
     )
     .await?;
     decode_result(response)

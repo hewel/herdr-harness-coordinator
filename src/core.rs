@@ -135,6 +135,23 @@ impl SessionCapability {
     }
 }
 
+/// Opaque bearer scoped to one live pane-resident Host connection generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HostConnectionCapability(String);
+
+impl HostConnectionCapability {
+    fn generate() -> Self {
+        let mut bytes = [0_u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        Self(hex::encode(bytes))
+    }
+
+    fn digest(&self) -> String {
+        hex::encode(Sha256::digest(self.0.as_bytes()))
+    }
+}
+
 /// Authenticated command/query actor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -143,12 +160,39 @@ pub enum ActorContext {
     Bootstrap,
     /// Live Session authenticated by capability.
     Session { capability: SessionCapability },
+    /// Current pane-resident Host generation authenticated by its expiring lease.
+    Host {
+        capability: HostConnectionCapability,
+    },
+}
+
+impl From<SessionCapability> for ActorContext {
+    fn from(capability: SessionCapability) -> Self {
+        Self::Session { capability }
+    }
+}
+
+impl From<HostConnectionCapability> for ActorContext {
+    fn from(capability: HostConnectionCapability) -> Self {
+        Self::Host { capability }
+    }
 }
 
 /// State-changing operations accepted by [`Coordinator::execute`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum CoordinatorCommand {
+    /// Bind a new expiring Host connection and fence the previous generation.
+    BindHostConnection {
+        instance_id: String,
+        lease_seconds: u32,
+    },
+    /// Extend the current Host connection's presence lease.
+    RenewHostConnection,
+    /// Close the current Host connection without ending its durable Session.
+    DisconnectHostConnection { diagnostic: Option<String> },
+    /// Expire stale Host connections and conservatively settle ambiguous work.
+    ReapStaleHostConnections,
     /// Copy a regular file into immutable Coordinator-owned storage.
     AdmitAttachment {
         source: PathBuf,
@@ -270,6 +314,14 @@ pub enum CoordinatorCommand {
     AcceptSupervisorEvent {
         event_id: SupervisorEventId,
         native_correlation: String,
+        native_turn_id: Option<String>,
+        evidence: String,
+    },
+    /// Append provider-native evidence that an accepted event entered its visible turn.
+    RecordSupervisorEventPresentation {
+        event_id: SupervisorEventId,
+        phase: SupervisorPresentationPhase,
+        native_turn_id: Option<String>,
         evidence: String,
     },
     /// Mark an attempted native Supervisor injection as ambiguous.
@@ -330,6 +382,14 @@ pub enum SupervisorEventResolution {
     Retry,
     Processed,
     Cancel,
+}
+
+/// Provider-native presentation evidence for an accepted Supervisor event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorPresentationPhase {
+    TurnStarted,
+    TurnCompleted,
 }
 
 /// Read-only operations accepted by [`Coordinator::query`].
@@ -589,6 +649,10 @@ pub struct HoldView {
 pub struct SessionSelfView {
     /// Live Coordinator Session identity.
     pub session_id: HarnessSessionId,
+    /// Previously bound native OMP Session identity, when present.
+    pub native_session_id: Option<String>,
+    /// Previously bound native Codex thread identity, when present.
+    pub native_thread_id: Option<String>,
     /// Durable Harness definition.
     pub definition: HarnessDefinitionV1,
     /// Exact selected launch profile source for Workers.
@@ -607,6 +671,19 @@ pub struct SessionSelfView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandOutcome {
+    /// A new generation-fenced Host connection was bound.
+    HostConnectionBound {
+        connection_id: String,
+        generation: u64,
+        capability: HostConnectionCapability,
+        expires_at: String,
+    },
+    /// The current Host connection lease was extended.
+    HostConnectionRenewed { expires_at: String },
+    /// The Host connection was disconnected or expired.
+    HostConnectionDisconnected,
+    /// Number of stale Host connections expired by the daemon.
+    StaleHostConnectionsReaped { count: u32 },
     /// File was copied, hashed, and indexed.
     AttachmentAdmitted { attachment: AttachmentMetadata },
     /// Inbox read markers were persisted.
@@ -815,8 +892,33 @@ impl Coordinator {
         command: CoordinatorCommand,
     ) -> Result<CommandOutcome, CoordinatorError> {
         match (actor, command) {
+            (ActorContext::Bootstrap, CoordinatorCommand::ReapStaleHostConnections) => {
+                self.reap_stale_host_connections().await
+            }
             (ActorContext::Bootstrap, CoordinatorCommand::RegisterSupervisor { definition }) => {
                 self.register_supervisor(definition).await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::BindHostConnection {
+                    instance_id,
+                    lease_seconds,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.bind_host_connection(&actor, instance_id, lease_seconds)
+                    .await
+            }
+            (ActorContext::Host { capability }, CoordinatorCommand::RenewHostConnection) => {
+                let actor = self.authenticate_host(&capability).await?;
+                self.renew_host_connection(&actor).await
+            }
+            (
+                ActorContext::Host { capability },
+                CoordinatorCommand::DisconnectHostConnection { diagnostic },
+            ) => {
+                let actor = self.authenticate_host(&capability).await?;
+                self.disconnect_host_connection(&actor, diagnostic).await
             }
             (
                 ActorContext::Session { capability },
@@ -1101,13 +1203,40 @@ impl Coordinator {
                 CoordinatorCommand::AcceptSupervisorEvent {
                     event_id,
                     native_correlation,
+                    native_turn_id,
                     evidence,
                 },
             ) => {
                 let actor = self.authenticate(&capability).await?;
                 self.require_supervisor(&actor)?;
-                self.accept_supervisor_event(&actor, event_id, native_correlation, evidence)
-                    .await
+                self.accept_supervisor_event(
+                    &actor,
+                    event_id,
+                    native_correlation,
+                    native_turn_id,
+                    evidence,
+                )
+                .await
+            }
+            (
+                ActorContext::Host { capability },
+                CoordinatorCommand::RecordSupervisorEventPresentation {
+                    event_id,
+                    phase,
+                    native_turn_id,
+                    evidence,
+                },
+            ) => {
+                let actor = self.authenticate_host(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.record_supervisor_event_presentation(
+                    &actor,
+                    event_id,
+                    phase,
+                    native_turn_id,
+                    evidence,
+                )
+                .await
             }
             (
                 ActorContext::Session { capability },
@@ -1172,9 +1301,156 @@ impl Coordinator {
                 let actor = self.authenticate(&capability).await?;
                 self.record_host_event(&actor, sequence, event).await
             }
+            (ActorContext::Host { capability }, command) => {
+                let actor = self.authenticate_host(&capability).await?;
+                self.execute_host_command(&actor, command).await
+            }
             _ => Err(CoordinatorError::new(
                 ErrorCategory::Forbidden,
                 "command is not permitted for this actor",
+            )),
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive generation-fenced Host authorization boundary"
+    )]
+    async fn execute_host_command(
+        &self,
+        actor: &AuthenticatedActor,
+        command: CoordinatorCommand,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        match command {
+            CoordinatorCommand::MarkInboxRead { message_ids } => {
+                self.mark_inbox_read(actor, message_ids).await
+            }
+            CoordinatorCommand::ClaimNextTask => self.claim_next_task(actor).await,
+            CoordinatorCommand::RotateWorkerSession => self.rotate_worker_session(actor).await,
+            CoordinatorCommand::AcceptDelivery {
+                message_id,
+                native_correlation,
+            } => {
+                self.accept_delivery(actor, message_id, native_correlation)
+                    .await
+            }
+            CoordinatorCommand::RecordTurnCompleted {
+                task_id,
+                native_turn_id,
+                succeeded,
+            } => {
+                self.record_turn_completed(actor, task_id, native_turn_id, succeeded)
+                    .await
+            }
+            CoordinatorCommand::RecordCancellationCompleted { task_id, succeeded } => {
+                self.record_cancellation_completed(actor, task_id, succeeded)
+                    .await
+            }
+            CoordinatorCommand::MarkDeliveryUnknown {
+                message_id,
+                diagnostic,
+            } => {
+                self.mark_delivery_unknown(actor, message_id, diagnostic)
+                    .await
+            }
+            CoordinatorCommand::RecordHostStopped { clean } => {
+                self.record_host_stopped(actor, clean).await
+            }
+            CoordinatorCommand::RecordHostFailed { diagnostic } => {
+                self.record_host_failed(actor, diagnostic).await
+            }
+            CoordinatorCommand::RecordHostReady => self.record_host_ready(actor).await,
+            CoordinatorCommand::RecordHostCompatibility {
+                resolved_executable,
+                observed_version,
+                native_session_id,
+                native_thread_id,
+                effective_model,
+                safe_compaction,
+                evidence,
+            } => {
+                self.record_host_compatibility(
+                    actor,
+                    resolved_executable,
+                    observed_version,
+                    native_session_id,
+                    native_thread_id,
+                    effective_model,
+                    safe_compaction,
+                    evidence,
+                )
+                .await
+            }
+            CoordinatorCommand::RecordSupervisorBinding {
+                native_session_id,
+                native_thread_id,
+            } => {
+                self.record_supervisor_binding(actor, native_session_id, native_thread_id)
+                    .await
+            }
+            CoordinatorCommand::RecordSupervisorDisconnected { diagnostic } => {
+                self.record_supervisor_disconnected(actor, diagnostic).await
+            }
+            CoordinatorCommand::RecordAdapterSnapshot { snapshot } => {
+                self.record_adapter_snapshot(actor, snapshot).await
+            }
+            CoordinatorCommand::ClaimNextSupervisorEvent => {
+                self.require_supervisor(actor)?;
+                self.claim_next_supervisor_event(actor).await
+            }
+            CoordinatorCommand::AcceptSupervisorEvent {
+                event_id,
+                native_correlation,
+                native_turn_id,
+                evidence,
+            } => {
+                self.require_supervisor(actor)?;
+                self.accept_supervisor_event(
+                    actor,
+                    event_id,
+                    native_correlation,
+                    native_turn_id,
+                    evidence,
+                )
+                .await
+            }
+            CoordinatorCommand::MarkSupervisorEventUnknown {
+                event_id,
+                diagnostic,
+            } => {
+                self.require_supervisor(actor)?;
+                self.mark_supervisor_event_unknown(event_id, diagnostic)
+                    .await
+            }
+            CoordinatorCommand::ReleaseSupervisorEvent {
+                event_id,
+                diagnostic,
+            } => {
+                self.require_supervisor(actor)?;
+                self.release_supervisor_event(event_id, diagnostic).await
+            }
+            CoordinatorCommand::RecordSupervisorEventPresentation {
+                event_id,
+                phase,
+                native_turn_id,
+                evidence,
+            } => {
+                self.require_supervisor(actor)?;
+                self.record_supervisor_event_presentation(
+                    actor,
+                    event_id,
+                    phase,
+                    native_turn_id,
+                    evidence,
+                )
+                .await
+            }
+            CoordinatorCommand::RecordHostEvent { sequence, event } => {
+                self.record_host_event(actor, sequence, event).await
+            }
+            _ => Err(CoordinatorError::new(
+                ErrorCategory::Forbidden,
+                "command is not permitted for a managed Host connection",
             )),
         }
     }
@@ -1184,18 +1460,25 @@ impl Coordinator {
     /// # Errors
     ///
     /// Returns [`CoordinatorError`] when authentication or storage fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive authenticated query authorization boundary"
+    )]
     pub async fn query(
         &self,
         actor: ActorContext,
         query: CoordinatorQuery,
     ) -> Result<QueryResult, CoordinatorError> {
-        let ActorContext::Session { capability } = actor else {
-            return Err(CoordinatorError::new(
-                ErrorCategory::Unauthenticated,
-                "a live Session capability is required",
-            ));
+        let actor = match actor {
+            ActorContext::Session { capability } => self.authenticate(&capability).await?,
+            ActorContext::Host { capability } => self.authenticate_host(&capability).await?,
+            ActorContext::Bootstrap => {
+                return Err(CoordinatorError::new(
+                    ErrorCategory::Unauthenticated,
+                    "a live Session or Host capability is required",
+                ));
+            }
         };
-        let actor = self.authenticate(&capability).await?;
         match query {
             CoordinatorQuery::ListHarnesses => {
                 let rows = sqlx::query("SELECT id FROM harnesses ORDER BY created_at, id")
@@ -1568,7 +1851,7 @@ impl Coordinator {
         &self,
         actor: &AuthenticatedActor,
     ) -> Result<QueryResult, CoordinatorError> {
-        let row = sqlx::query("SELECT h.definition_json, s.profile_snapshot_json, s.profile_digest, s.presence, s.activity, s.event_sequence FROM harness_sessions s JOIN harnesses h ON h.id = s.harness_id WHERE s.id = ? AND s.ended_at IS NULL")
+        let row = sqlx::query("SELECT h.definition_json, s.native_session_id, s.native_thread_id, s.profile_snapshot_json, s.profile_digest, s.presence, s.activity, s.event_sequence FROM harness_sessions s JOIN harnesses h ON h.id = s.harness_id WHERE s.id = ? AND s.ended_at IS NULL")
             .bind(actor.session_id.to_string())
             .fetch_optional(&self.pool)
             .await
@@ -1576,6 +1859,12 @@ impl Coordinator {
             .ok_or_else(|| CoordinatorError::new(ErrorCategory::NotFound, "Session is no longer active"))?;
         Ok(QueryResult::Session(SessionSelfView {
             session_id: actor.session_id,
+            native_session_id: row
+                .get::<Option<&str>, _>("native_session_id")
+                .map(str::to_owned),
+            native_thread_id: row
+                .get::<Option<&str>, _>("native_thread_id")
+                .map(str::to_owned),
             definition: serde_json::from_str(row.get("definition_json"))
                 .map_err(CoordinatorError::storage)?,
             profile_snapshot: row
@@ -4623,6 +4912,15 @@ impl Coordinator {
             }
         }
         let now = timestamp();
+        if let Some(connection_id) = &actor.host_connection_id {
+            sqlx::query("UPDATE host_connections SET status = 'disconnected', disconnected_at = ?, disconnect_reason = ? WHERE id = ? AND status = 'active'")
+                .bind(&now)
+                .bind(if clean { "Worker Host stopped cleanly" } else { "Worker Host stopped without clean provider shutdown" })
+                .bind(connection_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
         sqlx::query("UPDATE harness_sessions SET presence = ?, activity = ?, ended_at = ?, last_seen_at = ? WHERE id = ? AND ended_at IS NULL")
             .bind(if clean { "stopped" } else { "failed" })
             .bind(if clean { "idle" } else { "failed" })
@@ -4849,6 +5147,15 @@ impl Coordinator {
         }
         let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
         let now = timestamp();
+        if let Some(connection_id) = &actor.host_connection_id {
+            sqlx::query("UPDATE host_connections SET status = 'disconnected', disconnected_at = ?, disconnect_reason = ? WHERE id = ? AND status = 'active'")
+                .bind(&now)
+                .bind(diagnostic.as_deref().unwrap_or("managed Supervisor disconnected"))
+                .bind(connection_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
         mark_unsettled_supervisor_delivery_unknown(
             &mut transaction,
             diagnostic
@@ -4857,7 +5164,7 @@ impl Coordinator {
             &now,
         )
         .await?;
-        let changed = sqlx::query("UPDATE harness_sessions SET presence = 'offline', activity = 'idle', native_health = 'ambiguous', adapter_snapshot_json = NULL, adapter_snapshot_at = NULL, last_seen_at = ? WHERE id = ? AND ended_at IS NULL")
+        let changed = sqlx::query("UPDATE harness_sessions SET presence = 'disconnected', activity = 'idle', native_health = 'ambiguous', adapter_snapshot_json = NULL, adapter_snapshot_at = NULL, last_seen_at = ? WHERE id = ? AND ended_at IS NULL")
             .bind(&now)
             .bind(actor.session_id.to_string())
             .execute(&mut *transaction)
@@ -4919,11 +5226,12 @@ impl Coordinator {
             .fetch_one(&mut *transaction)
             .await
             .map_err(CoordinatorError::storage)?;
-        sqlx::query("INSERT INTO supervisor_event_attempts (id, event_id, attempt_number, target_session_id, state, provider_bytes_may_have_been_written, acceptance_evidence_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'dispatching', 0, '{}', ?, ?)")
+        sqlx::query("INSERT INTO supervisor_event_attempts (id, event_id, attempt_number, target_session_id, target_host_connection_id, state, provider_bytes_may_have_been_written, acceptance_evidence_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'dispatching', 0, '{}', ?, ?)")
             .bind(DeliveryAttemptId::new().to_string())
             .bind(event.id.to_string())
             .bind(attempt_number)
             .bind(actor.session_id.to_string())
+            .bind(actor.host_connection_id.as_deref())
             .bind(&now)
             .bind(&now)
             .execute(&mut *transaction)
@@ -4946,6 +5254,7 @@ impl Coordinator {
         actor: &AuthenticatedActor,
         event_id: SupervisorEventId,
         native_correlation: String,
+        native_turn_id: Option<String>,
         evidence: String,
     ) -> Result<CommandOutcome, CoordinatorError> {
         if native_correlation.trim().is_empty() || evidence.trim().is_empty() {
@@ -4971,10 +5280,70 @@ impl Coordinator {
         }
         sqlx::query("UPDATE supervisor_event_attempts SET state = 'accepted', native_correlation = ?, acceptance_evidence_json = ?, updated_at = ? WHERE event_id = ? AND target_session_id = ? AND state = 'dispatching'")
             .bind(native_correlation)
-            .bind(serde_json::to_string(&json_evidence(&evidence)).map_err(CoordinatorError::storage)?)
+            .bind(serde_json::to_string(&serde_json::json!({"acceptance": evidence, "native_turn_id": native_turn_id})).map_err(CoordinatorError::storage)?)
             .bind(&now)
             .bind(event_id.to_string())
             .bind(actor.session_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::SupervisorEventUpdated {
+            event_id,
+            state: SupervisorEventDeliveryState::Accepted,
+        })
+    }
+
+    async fn record_supervisor_event_presentation(
+        &self,
+        actor: &AuthenticatedActor,
+        event_id: SupervisorEventId,
+        phase: SupervisorPresentationPhase,
+        native_turn_id: Option<String>,
+        evidence: String,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if evidence.trim().is_empty() || evidence.len() > 16_384 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "Supervisor presentation evidence must contain 1 to 16,384 bytes",
+            ));
+        }
+        let phase_text = match phase {
+            SupervisorPresentationPhase::TurnStarted => "turn_started",
+            SupervisorPresentationPhase::TurnCompleted => "turn_completed",
+        };
+        let observation_key = format!(
+            "{}:{phase_text}:{}",
+            event_id,
+            native_turn_id.as_deref().unwrap_or("none")
+        );
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let attempt = sqlx::query("SELECT id FROM supervisor_event_attempts WHERE event_id = ? AND target_session_id = ? AND state = 'accepted' ORDER BY attempt_number DESC LIMIT 1")
+            .bind(event_id.to_string())
+            .bind(actor.session_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::InvalidState, "presentation evidence requires an accepted event attempt"))?;
+        let native = sqlx::query("SELECT native_session_id, native_thread_id FROM harness_sessions WHERE id = ? AND ended_at IS NULL")
+            .bind(actor.session_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        sqlx::query("INSERT OR IGNORE INTO supervisor_event_observations (id, observation_key, event_id, attempt_id, observation_kind, native_session_id, native_thread_id, native_turn_id, evidence_json, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(Uuid::now_v7().to_string())
+            .bind(observation_key)
+            .bind(event_id.to_string())
+            .bind(attempt.get::<&str, _>("id"))
+            .bind(phase_text)
+            .bind(native.get::<Option<&str>, _>("native_session_id"))
+            .bind(native.get::<Option<&str>, _>("native_thread_id"))
+            .bind(native_turn_id)
+            .bind(serde_json::to_string(&json_evidence(&evidence)).map_err(CoordinatorError::storage)?)
+            .bind(timestamp())
             .execute(&mut *transaction)
             .await
             .map_err(CoordinatorError::storage)?;
@@ -5151,16 +5520,19 @@ impl Coordinator {
                 "reconciliation audit note must contain 1 to 4096 bytes",
             ));
         }
-        let (state, processed_at) = match resolution {
-            SupervisorEventResolution::Retry => ("pending", None),
-            SupervisorEventResolution::Processed => ("processed", Some(timestamp())),
-            SupervisorEventResolution::Cancel => ("cancelled", None),
+        let (state, processed_at, resolution_text) = match resolution {
+            SupervisorEventResolution::Retry => ("pending", None, "retry"),
+            SupervisorEventResolution::Processed => ("processed", Some(timestamp()), "processed"),
+            SupervisorEventResolution::Cancel => ("cancelled", None, "cancel"),
         };
         let now = timestamp();
-        let evidence = serde_json::to_string(&json_evidence(&audit_note))
-            .map_err(CoordinatorError::storage)?;
         let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
-        let changed = sqlx::query("UPDATE supervisor_events SET state = ?, processed_at = ?, summary = summary || ' [reconciled]', updated_at = ? WHERE id = ? AND state = 'unknown'")
+        let attempt_id: Option<String> = sqlx::query_scalar("SELECT id FROM supervisor_event_attempts WHERE event_id = ? ORDER BY attempt_number DESC LIMIT 1")
+            .bind(event_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let changed = sqlx::query("UPDATE supervisor_events SET state = ?, processed_at = ?, updated_at = ? WHERE id = ? AND state = 'unknown'")
             .bind(state)
             .bind(processed_at)
             .bind(&now)
@@ -5175,11 +5547,13 @@ impl Coordinator {
                 "only an Unknown Supervisor event may be reconciled",
             ));
         }
-        sqlx::query("UPDATE supervisor_event_attempts SET acceptance_evidence_json = ?, updated_at = ? WHERE event_id = ? AND attempt_number = (SELECT MAX(attempt_number) FROM supervisor_event_attempts WHERE event_id = ?)")
-            .bind(evidence)
+        sqlx::query("INSERT INTO supervisor_event_reconciliations (id, event_id, attempt_id, resolution, audit_note, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(Uuid::now_v7().to_string())
+            .bind(event_id.to_string())
+            .bind(attempt_id)
+            .bind(resolution_text)
+            .bind(audit_note)
             .bind(&now)
-            .bind(event_id.to_string())
-            .bind(event_id.to_string())
             .execute(&mut *transaction)
             .await
             .map_err(CoordinatorError::storage)?;
@@ -5306,8 +5680,17 @@ impl Coordinator {
         }
         let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
         let now = timestamp();
+        if let Some(connection_id) = &actor.host_connection_id {
+            sqlx::query("UPDATE host_connections SET status = 'disconnected', disconnected_at = ?, disconnect_reason = ? WHERE id = ? AND status = 'active'")
+                .bind(&now)
+                .bind(&diagnostic)
+                .bind(connection_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
         if let Some((task_id, state, submission)) = active {
-            if state != TaskState::DeliveryUnknown {
+            if !matches!(state, TaskState::DeliveryUnknown | TaskState::Reviewing) {
                 let evidence = serde_json::to_string(&serde_json::json!({
                     "host_failure": diagnostic,
                 }))
@@ -5456,14 +5839,235 @@ impl Coordinator {
         })
     }
 
+    async fn bind_host_connection(
+        &self,
+        actor: &AuthenticatedActor,
+        instance_id: String,
+        lease_seconds: u32,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if instance_id.trim().is_empty() || instance_id.len() > 256 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "Host instance ID must contain 1 to 256 bytes",
+            ));
+        }
+        if !(1..=300).contains(&lease_seconds) {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "Host lease must be between 1 and 300 seconds",
+            ));
+        }
+        let connection_id = Uuid::now_v7().to_string();
+        let capability = HostConnectionCapability::generate();
+        let now = Utc::now();
+        let now_text = now.to_rfc3339_opts(SecondsFormat::Micros, true);
+        let expires_at = (now + chrono::Duration::seconds(i64::from(lease_seconds)))
+            .to_rfc3339_opts(SecondsFormat::Micros, true);
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        sqlx::query("UPDATE host_connections SET status = 'disconnected', disconnected_at = ?, disconnect_reason = 'superseded by a newer Host generation' WHERE session_id = ? AND status = 'active'")
+            .bind(&now_text)
+            .bind(actor.session_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let generation: i64 = sqlx::query_scalar(
+            "UPDATE harness_sessions SET connection_generation = connection_generation + 1, last_seen_at = ? WHERE id = ? AND ended_at IS NULL RETURNING connection_generation",
+        )
+        .bind(&now_text)
+        .bind(actor.session_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?
+        .ok_or_else(|| {
+            CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Host connection requires a live Coordinator Session",
+            )
+        })?;
+        sqlx::query("INSERT INTO host_connections (id, session_id, generation, instance_id, capability_hash, lease_seconds, status, bound_at, last_heartbeat_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)")
+            .bind(&connection_id)
+            .bind(actor.session_id.to_string())
+            .bind(generation)
+            .bind(instance_id)
+            .bind(capability.digest())
+            .bind(i64::from(lease_seconds))
+            .bind(&now_text)
+            .bind(&now_text)
+            .bind(&expires_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::HostConnectionBound {
+            connection_id,
+            generation: u64::try_from(generation).map_err(CoordinatorError::storage)?,
+            capability,
+            expires_at,
+        })
+    }
+
+    async fn renew_host_connection(
+        &self,
+        actor: &AuthenticatedActor,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        let connection_id = actor.host_connection_id.as_deref().ok_or_else(|| {
+            CoordinatorError::new(ErrorCategory::Forbidden, "a Host connection is required")
+        })?;
+        let lease_seconds: i64 = sqlx::query_scalar(
+            "SELECT lease_seconds FROM host_connections WHERE id = ? AND status = 'active'",
+        )
+        .bind(connection_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(CoordinatorError::storage)?
+        .ok_or_else(|| {
+            CoordinatorError::new(
+                ErrorCategory::Unauthenticated,
+                "Host connection has expired",
+            )
+        })?;
+        let now = Utc::now();
+        let now_text = now.to_rfc3339_opts(SecondsFormat::Micros, true);
+        let expires_at = (now + chrono::Duration::seconds(lease_seconds))
+            .to_rfc3339_opts(SecondsFormat::Micros, true);
+        let changed = sqlx::query("UPDATE host_connections SET last_heartbeat_at = ?, expires_at = ? WHERE id = ? AND status = 'active'")
+            .bind(&now_text)
+            .bind(&expires_at)
+            .bind(connection_id)
+            .execute(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Unauthenticated,
+                "Host connection has expired",
+            ));
+        }
+        sqlx::query(
+            "UPDATE harness_sessions SET last_seen_at = ? WHERE id = ? AND ended_at IS NULL",
+        )
+        .bind(&now_text)
+        .bind(actor.session_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::HostConnectionRenewed { expires_at })
+    }
+
+    async fn disconnect_host_connection(
+        &self,
+        actor: &AuthenticatedActor,
+        diagnostic: Option<String>,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if diagnostic
+            .as_ref()
+            .is_some_and(|value| value.len() > 16_384)
+        {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "Host disconnect diagnostic exceeds 16 KiB",
+            ));
+        }
+        let connection_id = actor.host_connection_id.as_deref().ok_or_else(|| {
+            CoordinatorError::new(ErrorCategory::Forbidden, "a Host connection is required")
+        })?;
+        let now = timestamp();
+        let changed = sqlx::query("UPDATE host_connections SET status = 'disconnected', disconnected_at = ?, disconnect_reason = ? WHERE id = ? AND status = 'active'")
+            .bind(&now)
+            .bind(diagnostic)
+            .bind(connection_id)
+            .execute(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Unauthenticated,
+                "Host connection is no longer active",
+            ));
+        }
+        Ok(CommandOutcome::HostConnectionDisconnected)
+    }
+
+    async fn reap_stale_host_connections(&self) -> Result<CommandOutcome, CoordinatorError> {
+        let now = timestamp();
+        let stale = sqlx::query("SELECT c.id AS connection_id, s.id AS session_id, h.id AS harness_id, h.tier FROM host_connections c JOIN harness_sessions s ON s.id = c.session_id JOIN harnesses h ON h.id = s.harness_id WHERE c.status = 'active' AND c.expires_at <= ? AND s.ended_at IS NULL ORDER BY c.expires_at")
+            .bind(&now)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let changed = sqlx::query("UPDATE host_connections SET status = 'expired', disconnected_at = ?, disconnect_reason = 'presence lease expired' WHERE status = 'active' AND expires_at <= ?")
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        for row in stale {
+            let tier = match row.get::<&str, _>("tier") {
+                "supervisor" => HarnessTier::Supervisor,
+                "worker" => HarnessTier::Worker,
+                value => {
+                    return Err(CoordinatorError::new(
+                        ErrorCategory::StorageFailure,
+                        format!("unknown Harness tier `{value}`"),
+                    ));
+                }
+            };
+            let actor = AuthenticatedActor {
+                id: HarnessId::from_str(row.get("harness_id"))
+                    .map_err(CoordinatorError::storage)?,
+                tier,
+                session_id: parse_uuid_id(row.get("session_id"))?,
+                host_connection_id: Some(row.get::<&str, _>("connection_id").to_owned()),
+            };
+            if tier == HarnessTier::Supervisor {
+                self.record_supervisor_disconnected(
+                    &actor,
+                    Some("managed Supervisor presence lease expired".to_owned()),
+                )
+                .await?;
+                continue;
+            }
+            let dispatching_message: Option<String> = sqlx::query_scalar("SELECT m.id FROM tasks t JOIN messages m ON m.task_id = t.id AND m.kind = 'task' WHERE t.worker_id = ? AND t.state = 'dispatching' ORDER BY t.created_sequence, m.created_sequence LIMIT 1")
+                .bind(actor.id.as_str())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(CoordinatorError::storage)?;
+            if let Some(message_id) = dispatching_message {
+                self.mark_delivery_unknown(
+                    &actor,
+                    parse_uuid_id(&message_id)?,
+                    "Worker Host presence expired during native Task dispatch".to_owned(),
+                )
+                .await?;
+            } else {
+                self.record_host_failed(
+                    &actor,
+                    "Worker Host presence lease expired without a clean disconnect".to_owned(),
+                )
+                .await?;
+            }
+        }
+        Ok(CommandOutcome::StaleHostConnectionsReaped {
+            count: u32::try_from(changed).map_err(CoordinatorError::storage)?,
+        })
+    }
+
     async fn authenticate(
         &self,
         capability: &SessionCapability,
     ) -> Result<AuthenticatedActor, CoordinatorError> {
         let row = sqlx::query(
-            "SELECT h.id, h.tier, s.id AS session_id FROM harness_sessions s JOIN harnesses h ON h.id = s.harness_id WHERE s.capability_hash = ? AND s.ended_at IS NULL AND s.presence IN ('starting', 'online', 'disconnected', 'offline')",
+            "SELECT h.id, h.tier, s.id AS session_id, NULL AS connection_id FROM harness_sessions s JOIN harnesses h ON h.id = s.harness_id WHERE s.capability_hash = ? AND s.ended_at IS NULL AND s.presence IN ('starting', 'online', 'disconnected', 'offline') UNION ALL SELECT h.id, h.tier, s.id AS session_id, c.id AS connection_id FROM host_connections c JOIN harness_sessions s ON s.id = c.session_id JOIN harnesses h ON h.id = s.harness_id WHERE c.capability_hash = ? AND c.status = 'active' AND c.expires_at > ? AND c.generation = s.connection_generation AND s.ended_at IS NULL LIMIT 1",
         )
         .bind(capability.digest())
+        .bind(capability.digest())
+        .bind(timestamp())
         .fetch_optional(&self.pool)
         .await
         .map_err(CoordinatorError::storage)?
@@ -5488,6 +6092,38 @@ impl Coordinator {
             id,
             tier,
             session_id,
+            host_connection_id: row
+                .get::<Option<&str>, _>("connection_id")
+                .map(str::to_owned),
+        })
+    }
+
+    async fn authenticate_host(
+        &self,
+        capability: &HostConnectionCapability,
+    ) -> Result<AuthenticatedActor, CoordinatorError> {
+        let row = sqlx::query("SELECT h.id, h.tier, s.id AS session_id, c.id AS connection_id FROM host_connections c JOIN harness_sessions s ON s.id = c.session_id JOIN harnesses h ON h.id = s.harness_id WHERE c.capability_hash = ? AND c.status = 'active' AND c.expires_at > ? AND c.generation = s.connection_generation AND s.ended_at IS NULL")
+            .bind(capability.digest())
+            .bind(timestamp())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::Unauthenticated, "Host connection capability is invalid, expired, or superseded"))?;
+        let tier = match row.get::<&str, _>("tier") {
+            "supervisor" => HarnessTier::Supervisor,
+            "worker" => HarnessTier::Worker,
+            value => {
+                return Err(CoordinatorError::new(
+                    ErrorCategory::StorageFailure,
+                    format!("unknown Harness tier `{value}`"),
+                ));
+            }
+        };
+        Ok(AuthenticatedActor {
+            id: HarnessId::from_str(row.get("id")).map_err(CoordinatorError::storage)?,
+            tier,
+            session_id: parse_uuid_id(row.get("session_id"))?,
+            host_connection_id: Some(row.get::<&str, _>("connection_id").to_owned()),
         })
     }
 
@@ -5535,6 +6171,7 @@ struct AuthenticatedActor {
     id: HarnessId,
     tier: HarnessTier,
     session_id: HarnessSessionId,
+    host_connection_id: Option<String>,
 }
 
 fn validate_message_route(
