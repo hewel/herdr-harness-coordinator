@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use crate::contract::{
     DeliveryAttemptId, DeliveryIntent, HarnessDefinitionV1, HarnessId, HarnessSessionId,
-    HarnessTier, MessageId, MessageKind, MessageSubmissionV1, ResultManifestV1, TaskId,
-    TaskSubmissionV1, Validate,
+    HarnessTier, MessageId, MessageKind, MessageSubmissionV1, RepositoryAccess,
+    RepositoryObservationV1, ResultManifestV1, TaskId, TaskSubmissionV1, Validate, WorktreeHoldId,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -147,6 +147,42 @@ pub enum CoordinatorCommand {
         native_turn_id: String,
         succeeded: bool,
     },
+    /// Persist immutable Git evidence for one Task checkpoint.
+    RecordRepositoryObservation {
+        observation: RepositoryObservationV1,
+    },
+    /// Accept the current reviewable Result against exact repository evidence.
+    ApproveTask {
+        task_id: TaskId,
+        result_revision: u32,
+        observation_digest: String,
+    },
+    /// Request cancellation, or cancel immediately while still queued.
+    CancelTask { task_id: TaskId },
+    /// Confirm that the assigned provider settled a cancellation request.
+    RecordCancellationCompleted { task_id: TaskId, succeeded: bool },
+    /// Record that provider acceptance cannot be proven either way.
+    MarkDeliveryUnknown {
+        message_id: MessageId,
+        diagnostic: String,
+    },
+    /// Reconcile an uncertain dispatch against current repository evidence.
+    ResolveDeliveryUnknown {
+        task_id: TaskId,
+        resolution: DeliveryUnknownResolution,
+        observation_digest: String,
+        audit_note: String,
+    },
+}
+
+/// Explicit Supervisor resolution after ambiguous native acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryUnknownResolution {
+    /// Create a new audited delivery attempt after proving repository state.
+    Requeue,
+    /// Terminate the Task without replaying the uncertain native request.
+    Cancel,
 }
 
 /// Read-only operations accepted by [`Coordinator::query`].
@@ -278,6 +314,14 @@ pub enum CommandOutcome {
     ResultRecorded { task_id: TaskId, revision: u32 },
     /// A native turn ended and the Task state was updated.
     TurnCompleted { task_id: TaskId, state: TaskState },
+    /// Repository evidence was durably indexed.
+    ObservationRecorded { task_id: TaskId, digest: String },
+    /// Supervisor approved the current Result revision.
+    TaskApproved { task_id: TaskId },
+    /// Cancellation state was durably updated.
+    TaskCancellationUpdated { task_id: TaskId, state: TaskState },
+    /// Ambiguous delivery was recorded or explicitly reconciled.
+    DeliveryUnknownUpdated { task_id: TaskId, state: TaskState },
 }
 
 /// Successful query result.
@@ -409,6 +453,65 @@ impl Coordinator {
             ) => {
                 let actor = self.authenticate(&capability).await?;
                 self.record_turn_completed(&actor, task_id, native_turn_id, succeeded)
+                    .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::RecordRepositoryObservation { observation },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.record_repository_observation(&actor, observation)
+                    .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::ApproveTask {
+                    task_id,
+                    result_revision,
+                    observation_digest,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.approve_task(task_id, result_revision, observation_digest)
+                    .await
+            }
+            (ActorContext::Session { capability }, CoordinatorCommand::CancelTask { task_id }) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.cancel_task(task_id).await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::RecordCancellationCompleted { task_id, succeeded },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.record_cancellation_completed(&actor, task_id, succeeded)
+                    .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::MarkDeliveryUnknown {
+                    message_id,
+                    diagnostic,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.mark_delivery_unknown(&actor, message_id, diagnostic)
+                    .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::ResolveDeliveryUnknown {
+                    task_id,
+                    resolution,
+                    observation_digest,
+                    audit_note,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.resolve_delivery_unknown(task_id, resolution, observation_digest, audit_note)
                     .await
             }
             _ => Err(CoordinatorError::new(
@@ -673,6 +776,23 @@ impl Coordinator {
                 ));
             }
         }
+        let repository_key = submission.repository.root.to_string_lossy().into_owned();
+        if submission.repository.access == RepositoryAccess::Mutating {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT (SELECT COUNT(*) FROM worktree_holds WHERE repository_key = ? AND cleared_at IS NULL) + (SELECT COUNT(*) FROM worktree_leases WHERE repository_key = ? AND released_at IS NULL)",
+            )
+            .bind(&repository_key)
+            .bind(&repository_key)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+            if blocked != 0 {
+                return Err(CoordinatorError::new(
+                    ErrorCategory::RepositoryBlocked,
+                    "worktree has an active mutating lease or Hold",
+                ));
+            }
+        }
         let sequence = next_sequence(&mut transaction, "task_create").await?;
         let task_id = TaskId::new();
         let message_id = MessageId::new();
@@ -691,6 +811,15 @@ impl Coordinator {
             .execute(&mut *transaction)
             .await
             .map_err(CoordinatorError::storage)?;
+        if submission.repository.access == RepositoryAccess::Mutating {
+            sqlx::query("INSERT INTO worktree_leases (repository_key, task_id, acquired_at) VALUES (?, ?, ?) ON CONFLICT(repository_key) DO UPDATE SET task_id = excluded.task_id, acquired_at = excluded.acquired_at, released_at = NULL")
+                .bind(repository_key)
+                .bind(task_id.to_string())
+                .bind(&now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
         sqlx::query("INSERT INTO task_transitions (task_id, from_state, to_state, evidence_json, created_at) VALUES (?, NULL, 'queued', '{}', ?)")
             .bind(task_id.to_string())
             .bind(&now)
@@ -960,7 +1089,7 @@ impl Coordinator {
                 "only the destination Host may accept delivery",
             ));
         }
-        let changed = sqlx::query("UPDATE delivery_attempts SET state = 'accepted', native_correlation = ?, provider_bytes_may_have_been_written = 1, updated_at = ? WHERE message_id = ? AND attempt_number = 1 AND state IN ('pending','dispatching')")
+        let changed = sqlx::query("UPDATE delivery_attempts SET state = 'accepted', native_correlation = ?, provider_bytes_may_have_been_written = 1, updated_at = ? WHERE id = (SELECT id FROM delivery_attempts WHERE message_id = ? ORDER BY attempt_number DESC LIMIT 1) AND state IN ('pending','dispatching')")
             .bind(native_correlation)
             .bind(timestamp())
             .bind(message_id.to_string())
@@ -1132,6 +1261,455 @@ impl Coordinator {
         })
     }
 
+    async fn record_repository_observation(
+        &self,
+        actor: &AuthenticatedActor,
+        observation: RepositoryObservationV1,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        observation.validate().map_err(|error| {
+            CoordinatorError::new(ErrorCategory::InvalidInput, error.to_string())
+        })?;
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let worker_id: Option<String> =
+            sqlx::query_scalar("SELECT worker_id FROM tasks WHERE id = ?")
+                .bind(observation.task_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        let worker_id = worker_id
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist"))?;
+        if actor.tier != HarnessTier::Supervisor && actor.id.as_str() != worker_id {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Forbidden,
+                "only the assigned Worker or Supervisor may record Task repository evidence",
+            ));
+        }
+        sqlx::query("INSERT INTO repository_observations (id, task_id, checkpoint, digest, observation_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(observation.id.to_string())
+            .bind(observation.task_id.to_string())
+            .bind(observation_checkpoint_name(observation.checkpoint))
+            .bind(&observation.digest)
+            .bind(serde_json::to_string(&observation).map_err(CoordinatorError::storage)?)
+            .bind(timestamp())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| CoordinatorError::new(ErrorCategory::Conflict, error.to_string()))?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::ObservationRecorded {
+            task_id: observation.task_id,
+            digest: observation.digest,
+        })
+    }
+
+    async fn approve_task(
+        &self,
+        task_id: TaskId,
+        result_revision: u32,
+        observation_digest: String,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        validate_digest(&observation_digest)?;
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let task =
+            sqlx::query("SELECT state, result_revision, submission_json FROM tasks WHERE id = ?")
+                .bind(task_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?
+                .ok_or_else(|| {
+                    CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist")
+                })?;
+        require_state(task.get("state"), TaskState::Reviewing)?;
+        let current_revision: i64 = task.get("result_revision");
+        if current_revision != i64::from(result_revision) {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Conflict,
+                "Result revision is stale",
+            ));
+        }
+        let submission: TaskSubmissionV1 =
+            serde_json::from_str(task.get("submission_json")).map_err(CoordinatorError::storage)?;
+        let repository_key = submission.repository.root.to_string_lossy().into_owned();
+        let held: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM worktree_holds WHERE repository_key = ? AND cleared_at IS NULL",
+        )
+        .bind(&repository_key)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        if held != 0 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::RepositoryBlocked,
+                "worktree has an unresolved Hold",
+            ));
+        }
+        let observation_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM repository_observations WHERE task_id = ? AND digest = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(task_id.to_string())
+        .bind(&observation_digest)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let observation_id = observation_id.ok_or_else(|| {
+            CoordinatorError::new(
+                ErrorCategory::Conflict,
+                "current Repository Observation digest does not match",
+            )
+        })?;
+        let active_reviews: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE related_task_id = ? AND state IN ('dispatching','working','waiting','reviewing','cancelling','delivery_unknown')",
+        )
+        .bind(task_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        if active_reviews != 0 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Conflict,
+                "related review Task is still active",
+            ));
+        }
+        let now = timestamp();
+        let changed = sqlx::query("UPDATE tasks SET state = 'approved', approved_result_revision = ?, approval_observation_id = ?, updated_at = ? WHERE id = ? AND state = 'reviewing'")
+            .bind(current_revision)
+            .bind(observation_id)
+            .bind(&now)
+            .bind(task_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Task is no longer reviewing",
+            ));
+        }
+        record_transition(
+            &mut transaction,
+            task_id,
+            TaskState::Reviewing,
+            TaskState::Approved,
+            "{}",
+            &now,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE worktree_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL",
+        )
+        .bind(&now)
+        .bind(task_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::TaskApproved { task_id })
+    }
+
+    async fn cancel_task(&self, task_id: TaskId) -> Result<CommandOutcome, CoordinatorError> {
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let state_text: Option<String> = sqlx::query_scalar("SELECT state FROM tasks WHERE id = ?")
+            .bind(task_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let current = TaskState::from_str(&state_text.ok_or_else(|| {
+            CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist")
+        })?)?;
+        let next = if current == TaskState::Queued {
+            TaskState::Cancelled
+        } else if matches!(
+            current,
+            TaskState::Dispatching
+                | TaskState::Working
+                | TaskState::Waiting
+                | TaskState::Reviewing
+                | TaskState::DeliveryUnknown
+        ) {
+            TaskState::Cancelling
+        } else {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Task cannot be cancelled from its current state",
+            ));
+        };
+        let now = timestamp();
+        transition_exact(&mut transaction, task_id, current, next, false, &now).await?;
+        if next == TaskState::Cancelled {
+            sqlx::query("UPDATE worktree_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL")
+                .bind(&now)
+                .bind(task_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::TaskCancellationUpdated {
+            task_id,
+            state: next,
+        })
+    }
+
+    async fn record_cancellation_completed(
+        &self,
+        actor: &AuthenticatedActor,
+        task_id: TaskId,
+        succeeded: bool,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let task = sqlx::query("SELECT worker_id, state, submission_json FROM tasks WHERE id = ?")
+            .bind(task_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist"))?;
+        if actor.id.as_str() != task.get::<&str, _>("worker_id") {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Forbidden,
+                "only the assigned Worker Host may settle cancellation",
+            ));
+        }
+        require_state(task.get("state"), TaskState::Cancelling)?;
+        let next = if succeeded {
+            TaskState::Cancelled
+        } else {
+            TaskState::Failed
+        };
+        let now = timestamp();
+        transition_exact(
+            &mut transaction,
+            task_id,
+            TaskState::Cancelling,
+            next,
+            false,
+            &now,
+        )
+        .await?;
+        let submission: TaskSubmissionV1 =
+            serde_json::from_str(task.get("submission_json")).map_err(CoordinatorError::storage)?;
+        if submission.repository.access == RepositoryAccess::Mutating {
+            let repository_key = submission.repository.root.to_string_lossy().into_owned();
+            sqlx::query("INSERT INTO worktree_holds (id, repository_key, task_id, reason, created_at) VALUES (?, ?, ?, ?, ?)")
+                .bind(WorktreeHoldId::new().to_string())
+                .bind(repository_key)
+                .bind(task_id.to_string())
+                .bind(if succeeded { "cancelled_after_dispatch" } else { "cancellation_failed" })
+                .bind(&now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        } else {
+            sqlx::query("UPDATE worktree_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL")
+                .bind(&now)
+                .bind(task_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::TaskCancellationUpdated {
+            task_id,
+            state: next,
+        })
+    }
+
+    async fn mark_delivery_unknown(
+        &self,
+        actor: &AuthenticatedActor,
+        message_id: MessageId,
+        diagnostic: String,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if diagnostic.is_empty() || diagnostic.len() > 4096 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "delivery diagnostic must contain 1 to 4096 bytes",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let message = sqlx::query("SELECT task_id, recipient_id, kind FROM messages WHERE id = ?")
+            .bind(message_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| {
+                CoordinatorError::new(ErrorCategory::NotFound, "Message does not exist")
+            })?;
+        if message.get::<&str, _>("recipient_id") != actor.id.as_str() {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Forbidden,
+                "only the destination Host may report ambiguous acceptance",
+            ));
+        }
+        let task_id = parse_uuid_id::<TaskId>(
+            message.get::<Option<&str>, _>("task_id").ok_or_else(|| {
+                CoordinatorError::new(
+                    ErrorCategory::InvalidInput,
+                    "network Notification cannot make a Task delivery unknown",
+                )
+            })?,
+        )?;
+        let now = timestamp();
+        let attempt = sqlx::query("SELECT id, target_session_id FROM delivery_attempts WHERE message_id = ? ORDER BY attempt_number DESC LIMIT 1")
+            .bind(message_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        sqlx::query("UPDATE delivery_attempts SET state = 'unknown', provider_bytes_may_have_been_written = 1, evidence_json = ?, updated_at = ? WHERE id = ?")
+            .bind(serde_json::json!({"diagnostic": diagnostic}).to_string())
+            .bind(&now)
+            .bind(attempt.get::<&str, _>("id"))
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        if let Some(session_id) = attempt.get::<Option<&str>, _>("target_session_id") {
+            sqlx::query("UPDATE harness_sessions SET presence = 'failed', activity = 'failed', ended_at = ? WHERE id = ? AND ended_at IS NULL")
+                .bind(&now)
+                .bind(session_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+        let current_text: String = sqlx::query_scalar("SELECT state FROM tasks WHERE id = ?")
+            .bind(task_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let current = TaskState::from_str(&current_text)?;
+        if current != TaskState::Dispatching {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "only initial Task dispatch may enter delivery_unknown",
+            ));
+        }
+        transition_exact(
+            &mut transaction,
+            task_id,
+            current,
+            TaskState::DeliveryUnknown,
+            false,
+            &now,
+        )
+        .await?;
+        let submission_json: String =
+            sqlx::query_scalar("SELECT submission_json FROM tasks WHERE id = ?")
+                .bind(task_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        let submission: TaskSubmissionV1 =
+            serde_json::from_str(&submission_json).map_err(CoordinatorError::storage)?;
+        if submission.repository.access == RepositoryAccess::Mutating {
+            sqlx::query("INSERT INTO worktree_holds (id, repository_key, task_id, reason, created_at) VALUES (?, ?, ?, 'delivery_unknown', ?)")
+                .bind(WorktreeHoldId::new().to_string())
+                .bind(submission.repository.root.to_string_lossy().as_ref())
+                .bind(task_id.to_string())
+                .bind(&now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::DeliveryUnknownUpdated {
+            task_id,
+            state: TaskState::DeliveryUnknown,
+        })
+    }
+
+    async fn resolve_delivery_unknown(
+        &self,
+        task_id: TaskId,
+        resolution: DeliveryUnknownResolution,
+        observation_digest: String,
+        audit_note: String,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        validate_digest(&observation_digest)?;
+        if audit_note.trim().is_empty() || audit_note.len() > 4096 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "audit note must contain 1 to 4096 bytes",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let task = sqlx::query("SELECT state, submission_json FROM tasks WHERE id = ?")
+            .bind(task_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist"))?;
+        require_state(task.get("state"), TaskState::DeliveryUnknown)?;
+        let observation_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM repository_observations WHERE task_id = ? AND digest = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(task_id.to_string())
+        .bind(&observation_digest)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let observation_id = observation_id.ok_or_else(|| {
+            CoordinatorError::new(
+                ErrorCategory::Conflict,
+                "reconciliation Observation digest does not match",
+            )
+        })?;
+        let submission: TaskSubmissionV1 =
+            serde_json::from_str(task.get("submission_json")).map_err(CoordinatorError::storage)?;
+        let next = match resolution {
+            DeliveryUnknownResolution::Requeue => TaskState::Queued,
+            DeliveryUnknownResolution::Cancel => TaskState::Cancelled,
+        };
+        let now = timestamp();
+        transition_exact(
+            &mut transaction,
+            task_id,
+            TaskState::DeliveryUnknown,
+            next,
+            false,
+            &now,
+        )
+        .await?;
+        sqlx::query("UPDATE worktree_holds SET cleared_at = ?, observation_id = ?, audit_note = ? WHERE task_id = ? AND cleared_at IS NULL")
+            .bind(&now)
+            .bind(observation_id)
+            .bind(audit_note)
+            .bind(task_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        if next == TaskState::Cancelled
+            || submission.repository.access == RepositoryAccess::ReadOnly
+        {
+            sqlx::query("UPDATE worktree_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL")
+                .bind(&now)
+                .bind(task_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::DeliveryUnknownUpdated {
+            task_id,
+            state: next,
+        })
+    }
+
     async fn authenticate(
         &self,
         capability: &SessionCapability,
@@ -1238,9 +1816,17 @@ async fn create_delivery_attempt(
     provider_bytes_may_have_been_written: bool,
     now: &str,
 ) -> Result<(), CoordinatorError> {
-    sqlx::query("INSERT INTO delivery_attempts (id, message_id, attempt_number, target_session_id, state, provider_bytes_may_have_been_written, evidence_json, created_at, updated_at) VALUES (?, ?, 1, ?, ?, ?, '{}', ?, ?)")
+    let attempt_number: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM delivery_attempts WHERE message_id = ?",
+    )
+    .bind(message_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(CoordinatorError::storage)?;
+    sqlx::query("INSERT INTO delivery_attempts (id, message_id, attempt_number, target_session_id, state, provider_bytes_may_have_been_written, evidence_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?)")
         .bind(DeliveryAttemptId::new().to_string())
         .bind(message_id.to_string())
+        .bind(attempt_number)
         .bind(session_id)
         .bind(state)
         .bind(provider_bytes_may_have_been_written)
@@ -1356,6 +1942,17 @@ fn delivery_intent_name(intent: DeliveryIntent) -> &'static str {
     match intent {
         DeliveryIntent::FollowUp => "follow_up",
         DeliveryIntent::Steer => "steer",
+    }
+}
+
+fn observation_checkpoint_name(checkpoint: crate::contract::ObservationCheckpoint) -> &'static str {
+    match checkpoint {
+        crate::contract::ObservationCheckpoint::BeforeDispatch => "before_dispatch",
+        crate::contract::ObservationCheckpoint::Result => "result",
+        crate::contract::ObservationCheckpoint::Cancel => "cancel",
+        crate::contract::ObservationCheckpoint::Failure => "failure",
+        crate::contract::ObservationCheckpoint::Approval => "approval",
+        crate::contract::ObservationCheckpoint::HoldClear => "hold_clear",
     }
 }
 

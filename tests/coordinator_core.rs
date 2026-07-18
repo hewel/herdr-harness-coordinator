@@ -1,14 +1,17 @@
 use std::path::PathBuf;
 
+use chrono::Utc;
 use herdr_harness_coordinator::{
     contract::{
-        AttachmentId, DeliveryIntent, HarnessDefinitionV1, HarnessId, HarnessKind, HarnessTier,
-        MessageKind, MessageSubmissionV1, RepositoryAccess, ResultManifestV1, SCHEMA_VERSION,
-        TaskId, TaskRepositoryAuthorityV1, TaskSubmissionV1, VerificationResultV1, WriteScopeV1,
+        AttachmentId, CommandEvidenceV1, DeliveryIntent, HarnessDefinitionV1, HarnessId,
+        HarnessKind, HarnessTier, MessageKind, MessageSubmissionV1, ObservationCheckpoint,
+        RepositoryAccess, RepositoryObservationId, RepositoryObservationV1, ResultManifestV1,
+        SCHEMA_VERSION, TaskId, TaskRepositoryAuthorityV1, TaskSubmissionV1, VerificationResultV1,
+        WriteScopeV1,
     },
     core::{
         ActorContext, CommandOutcome, Coordinator, CoordinatorCommand, CoordinatorQuery,
-        QueryResult, SessionCapability, TaskState,
+        DeliveryUnknownResolution, QueryResult, SessionCapability, TaskState,
     },
 };
 
@@ -200,7 +203,9 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
     assert_task_state(&coordinator, &supervisor, task_id, TaskState::Reviewing, 0).await;
     coordinator
         .execute(
-            ActorContext::Session { capability: worker },
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
             CoordinatorCommand::AcceptDelivery {
                 message_id: correction_id,
                 native_correlation: "omp-follow-up-3".to_owned(),
@@ -209,6 +214,133 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
         .await
         .expect("accepted Correction must start the next Result revision");
     assert_task_state(&coordinator, &supervisor, task_id, TaskState::Working, 1).await;
+
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::CompleteTask {
+                manifest: result_manifest(task_id, "corrected result"),
+                native_turn_id: "turn-3".to_owned(),
+            },
+        )
+        .await
+        .expect("corrected Result must be admitted");
+    coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::RecordTurnCompleted {
+                task_id,
+                native_turn_id: "turn-3".to_owned(),
+                succeeded: true,
+            },
+        )
+        .await
+        .expect("corrected turn must become reviewable");
+    let digest = "a".repeat(64);
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::RecordRepositoryObservation {
+                observation: observation(task_id, &digest),
+            },
+        )
+        .await
+        .expect("Supervisor may index current approval evidence");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::ApproveTask {
+                task_id,
+                result_revision: 1,
+                observation_digest: digest,
+            },
+        )
+        .await
+        .expect("matching current Result and repository evidence must approve");
+    assert_task_state(&coordinator, &supervisor, task_id, TaskState::Approved, 1).await;
+}
+
+#[tokio::test]
+async fn queued_cancellation_is_terminal_without_native_dispatch() {
+    let (_state, coordinator, supervisor, _worker, task_id) = seeded_task().await;
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CancelTask { task_id },
+        )
+        .await
+        .expect("queued Task must cancel immediately");
+    assert_task_state(&coordinator, &supervisor, task_id, TaskState::Cancelled, 0).await;
+}
+
+#[tokio::test]
+async fn ambiguous_dispatch_requires_digest_confirmed_supervisor_reconciliation() {
+    let (_state, coordinator, supervisor, worker, task_id) = seeded_task().await;
+    let CommandOutcome::TaskDispatching { message_id, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::DispatchTask { task_id },
+        )
+        .await
+        .expect("Task must enter dispatching")
+    else {
+        panic!("dispatch must identify its Message")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::MarkDeliveryUnknown {
+                message_id,
+                diagnostic: "provider bytes were written before the pipe closed".to_owned(),
+            },
+        )
+        .await
+        .expect("destination Host must preserve ambiguous acceptance");
+    assert_task_state(
+        &coordinator,
+        &supervisor,
+        task_id,
+        TaskState::DeliveryUnknown,
+        0,
+    )
+    .await;
+    let digest = "b".repeat(64);
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::RecordRepositoryObservation {
+                observation: observation(task_id, &digest),
+            },
+        )
+        .await
+        .expect("Supervisor must capture current repository state");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::ResolveDeliveryUnknown {
+                task_id,
+                resolution: DeliveryUnknownResolution::Requeue,
+                observation_digest: digest,
+                audit_note: "No Task changes are present; safe to create a new attempt.".to_owned(),
+            },
+        )
+        .await
+        .expect("digest-confirmed reconciliation must allow explicit requeue");
+    assert_task_state(&coordinator, &supervisor, task_id, TaskState::Queued, 0).await;
 }
 
 #[tokio::test]
@@ -428,6 +560,35 @@ fn result_manifest(task_id: TaskId, summary: &str) -> ResultManifestV1 {
         deviations: Vec::new(),
         risks: Vec::new(),
         attachments: Vec::new(),
+    }
+}
+
+fn observation(task_id: TaskId, digest: &str) -> RepositoryObservationV1 {
+    RepositoryObservationV1 {
+        schema_version: SCHEMA_VERSION,
+        id: RepositoryObservationId::new(),
+        task_id,
+        checkpoint: ObservationCheckpoint::Approval,
+        worktree_root: PathBuf::from("/tmp/project"),
+        git_common_dir: PathBuf::from("/tmp/project/.git"),
+        head: None,
+        branch: Some("main".to_owned()),
+        index_digest: "0".repeat(64),
+        staged_diff: None,
+        unstaged_diff: None,
+        untracked: Vec::new(),
+        ignored_paths: Vec::new(),
+        status_entries: Vec::new(),
+        changed_paths: vec![PathBuf::from("src/lib.rs")],
+        scope_classifications: Vec::new(),
+        command_evidence: vec![CommandEvidenceV1 {
+            command: "git status --porcelain=v2 -z".to_owned(),
+            version: "git version 2".to_owned(),
+            exit_code: 0,
+            diagnostics: String::new(),
+        }],
+        captured_at: Utc::now(),
+        digest: digest.to_owned(),
     }
 }
 
