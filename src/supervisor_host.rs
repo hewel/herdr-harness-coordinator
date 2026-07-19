@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream};
+use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{
@@ -74,6 +75,7 @@ pub async fn run_managed_supervisor_host(
         Duration::from_secs(2),
     );
     let mut environment = inherited_supervisor_environment();
+    environment.extend(load_durable_supervisor_environment(state_dir).await?);
     environment.insert(
         "HERDR_HARNESS_CAPABILITY".to_owned(),
         serde_json::to_value(&host_capability)?
@@ -509,6 +511,28 @@ fn inherited_supervisor_environment() -> BTreeMap<String, String> {
     filter_supervisor_environment(std::env::vars())
 }
 
+#[derive(Deserialize)]
+struct DurableSupervisorRuntime {
+    environment: BTreeMap<String, String>,
+}
+
+async fn load_durable_supervisor_environment(state_dir: &Path) -> Result<BTreeMap<String, String>> {
+    let path = state_dir.join("managed-supervisor.json");
+    let bytes = tokio::fs::read(&path).await.with_context(|| {
+        format!(
+            "reading durable managed Supervisor runtime {}",
+            path.display()
+        )
+    })?;
+    let runtime: DurableSupervisorRuntime = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parsing durable managed Supervisor runtime {}",
+            path.display()
+        )
+    })?;
+    Ok(filter_supervisor_environment(runtime.environment))
+}
+
 fn filter_supervisor_environment(
     variables: impl IntoIterator<Item = (String, String)>,
 ) -> BTreeMap<String, String> {
@@ -804,7 +828,7 @@ fn compact_payload(event: &SupervisorEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::filter_supervisor_environment;
+    use super::{filter_supervisor_environment, load_durable_supervisor_environment};
 
     #[test]
     fn managed_codex_policy_survives_the_supervisor_environment_allowlist() {
@@ -827,6 +851,26 @@ mod tests {
                 .get("HERDR_CODEX_SANDBOX_MODE")
                 .map(String::as_str),
             Some("danger_full_access")
+        );
+        assert!(!environment.contains_key("UNSAFE_PROVIDER_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn managed_codex_policy_loads_from_durable_runtime() {
+        let state = tempfile::tempdir().expect("state directory");
+        tokio::fs::write(
+            state.path().join("managed-supervisor.json"),
+            r#"{"session_socket":"/tmp/herdr.sock","workspace_id":"w1","environment":{"HERDR_CODEX_APPROVAL_POLICY":"never","HERDR_CODEX_SANDBOX_MODE":"danger-full-access","UNSAFE_PROVIDER_SECRET":"drop-me"}}"#,
+        )
+        .await
+        .expect("durable runtime");
+        let environment = load_durable_supervisor_environment(state.path())
+            .await
+            .expect("durable policy");
+        assert_eq!(environment["HERDR_CODEX_APPROVAL_POLICY"], "never");
+        assert_eq!(
+            environment["HERDR_CODEX_SANDBOX_MODE"],
+            "danger-full-access"
         );
         assert!(!environment.contains_key("UNSAFE_PROVIDER_SECRET"));
     }
