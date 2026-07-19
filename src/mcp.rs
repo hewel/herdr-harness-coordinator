@@ -349,7 +349,7 @@ impl McpServer {
             .native_turn_id
             .clone()
             .or(args.native_turn_id)
-            .context("native turn ID is required for this provider")?;
+            .unwrap_or_else(|| format!("mcp-result-candidate:{}", uuid::Uuid::now_v7()));
         Ok(execute(CoordinatorCommand::CompleteTask {
             manifest: args.manifest,
             native_turn_id,
@@ -713,7 +713,7 @@ fn complete_schema() -> Value {
         "type":"object",
         "required":["manifest"],
         "properties":{
-            "native_turn_id":{"type":"string","minLength":1},
+            "native_turn_id":{"type":"string","minLength":1,"description":"Optional provider correlation. Omit when the provider does not expose its current turn ID; the Worker Host binds the candidate Result to authoritative terminal-turn evidence."},
             "manifest":{
                 "type":"object",
                 "required":["schema_version","task_id","summary","changed_files","verification","deviations","risks","attachments"],

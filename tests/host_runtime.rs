@@ -25,7 +25,7 @@ fn worker_task_prompt_requires_a_structured_result_at_the_coordinator_boundary()
 
     assert_eq!(
         prompt,
-        "Inspect Cargo.toml without editing files.\n\nCoordinator completion contract:\n- This is Task 019f7606-a26b-7a41-87dd-95f3a072a226.\n- Normal assistant text is not a Result and does not complete the Task.\n- Execute the requested verification command(s).\n- Call `fixture_attachment_create` with the exact verification output to create immutable evidence.\n- Then call `fixture_complete` exactly once with the current native turn ID and a `manifest` containing schema_version 1, this task_id, summary, changed_files, at least one verification entry referencing the returned Attachment ID, deviations, risks, and attachments.\n- Do not finish the native turn until `fixture_complete` reports that the Result was recorded."
+        "Inspect Cargo.toml without editing files.\n\nCoordinator completion contract:\n- This is Task 019f7606-a26b-7a41-87dd-95f3a072a226.\n- Normal assistant text is not a Result and does not complete the Task.\n- Execute the requested verification command(s).\n- Call `fixture_attachment_create` with the exact verification output to create immutable evidence.\n- Then call `fixture_complete` exactly once with a `manifest` containing schema_version 1, this task_id, summary, changed_files, at least one verification entry referencing the returned Attachment ID, deviations, risks, and attachments.\n- Do not invent or search for a native turn ID; omit native_turn_id unless the provider explicitly exposes it. The Worker Host binds the Result to terminal provider evidence.\n- Do not finish the native turn until `fixture_complete` reports that the Result was recorded."
     );
 }
 

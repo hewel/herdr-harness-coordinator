@@ -820,7 +820,7 @@ pub fn worker_task_prompt(
         complete,
     } = completion_tools;
     format!(
-        "{instructions}\n\nCoordinator completion contract:\n- This is Task {task_id}.\n- Normal assistant text is not a Result and does not complete the Task.\n- Execute the requested verification command(s).\n- Call `{attachment_create}` with the exact verification output to create immutable evidence.\n- Then call `{complete}` exactly once with the current native turn ID and a `manifest` containing schema_version 1, this task_id, summary, changed_files, at least one verification entry referencing the returned Attachment ID, deviations, risks, and attachments.\n- Do not finish the native turn until `{complete}` reports that the Result was recorded."
+        "{instructions}\n\nCoordinator completion contract:\n- This is Task {task_id}.\n- Normal assistant text is not a Result and does not complete the Task.\n- Execute the requested verification command(s).\n- Call `{attachment_create}` with the exact verification output to create immutable evidence.\n- Then call `{complete}` exactly once with a `manifest` containing schema_version 1, this task_id, summary, changed_files, at least one verification entry referencing the returned Attachment ID, deviations, risks, and attachments.\n- Do not invent or search for a native turn ID; omit native_turn_id unless the provider explicitly exposes it. The Worker Host binds the Result to terminal provider evidence.\n- Do not finish the native turn until `{complete}` reports that the Result was recorded."
     )
 }
 

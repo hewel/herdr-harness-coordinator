@@ -77,3 +77,44 @@ async fn mcp_notifications_do_not_emit_json_rpc_responses() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn completion_without_provider_turn_id_reaches_the_broker_boundary() {
+    let server = McpServer::new(
+        PathBuf::from("/tmp/not-connected.sock"),
+        SessionCapability::from_bearer("0".repeat(64)).expect("valid bearer shape"),
+    );
+    let response = server
+        .handle(json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"harness_complete",
+                "arguments":{
+                    "manifest":{
+                        "schema_version":1,
+                        "task_id":"019f7606-a26b-7a41-87dd-95f3a072a226",
+                        "summary":"candidate Result",
+                        "changed_files":[],
+                        "verification":[{
+                            "command":"true",
+                            "exit_code":0,
+                            "passed":true,
+                            "evidence":"019f7606-a26b-7a41-87dd-95f3a072a227"
+                        }],
+                        "deviations":[],
+                        "risks":[],
+                        "attachments":[]
+                    }
+                }
+            }
+        }))
+        .await
+        .expect("tool call response");
+    let diagnostic = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool error diagnostic");
+    assert!(response["result"]["isError"].as_bool().unwrap_or(false));
+    assert!(!diagnostic.contains("native turn ID is required"));
+}
