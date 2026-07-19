@@ -290,6 +290,12 @@ pub struct VerificationResultV1 {
 
 The Worker submits exactly one accepted Result per native turn through the Coordinator tool surface. The Task enters `Reviewing` only after the Result validates and the top-level native turn settles. Natural-language output is retained as transcript evidence but is not parsed as the Result.
 
+Provider tool processes that cannot observe the current native turn ID submit an
+opaque Result candidate correlation. This does not loosen attribution: the assigned
+Worker may submit only while its sole top-level Task is `Working`, and the
+pane-resident Worker Host replaces that candidate with authoritative terminal-turn
+evidence before the Task can enter `Reviewing`.
+
 Native children are never assigned Coordinator identities. Any tool call by a native descendant is attributed to its containing Worker Harness; the cooperative MVP relies on the top-level harness to consolidate its final Result.
 
 ## Communication

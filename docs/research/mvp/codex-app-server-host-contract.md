@@ -83,7 +83,15 @@ Calls are attributed to the containing Worker Harness, including calls made by a
 
 The shared MCP surface may advertise the Supervisor-only `harness_task_graph` query, but a Worker capability cannot invoke it. Dependency inputs arrive only as immutable Attachment references on the assigned Task; dependency edges never open a Worker-to-Worker route.
 
-The broker stores the Result candidate immediately. The Task moves to `reviewing` only after matching `turn/completed` with completed status and a successful Result Repository Observation. A terminal turn without one valid Result fails the Task.
+The broker stores the Result candidate immediately. Codex runs its Coordinator MCP
+child for the lifetime of the thread, so that child cannot inherit a new native turn
+ID for each App Server turn. `harness_complete` therefore permits the provider
+correlation to be omitted and records an opaque candidate correlation. Because one
+Worker Session has only one active top-level Task, the current Task and Result
+revision remain unambiguous. The Worker Host is the authority that replaces the
+candidate correlation with the observed `turn/completed` ID at settlement. The Task
+moves to `reviewing` only after completed terminal evidence and a successful Result
+Repository Observation. A terminal turn without one valid Result fails the Task.
 
 ## Events
 

@@ -74,14 +74,18 @@ never chooses `retry`, `processed`, or `cancel` on the Supervisor's behalf.
 
 ## Current verified behavior
 
-The 2026-07-18 run proved both directions and Correction reuse against Herdr 0.7.4,
-OMP 17.0.4, and Codex 0.144.5. Exact run IDs and limitations are in the completion
-report for the change that introduced this document. Normal CI remains fixture-only.
+The 2026-07-19 run proved both provider directions, busy queuing, idle automatic
+injection, and Codex Worker Correction reuse against Herdr 0.7.4, OMP 17.0.4,
+and Codex 0.144.5. Exact run IDs, native turns, pane IDs, fixes, and remaining
+release blockers are in `docs/live-evidence-2026-07-19.md`. Normal CI remains
+fixture-only.
 
 Codex App Server does not accept the CLI `--profile` option. Profile schema v3 pins
 the supported `approval_policy` and `sandbox_mode` values and sends them through
 `thread/start`. The live profile uses `danger-full-access`: `workspace-write` blocks
-the Unix-socket MCP bridge with `EPERM`.
+the Unix-socket MCP bridge with `EPERM`. Managed Supervisor policy is also retained
+in the private durable runtime file so reconnect does not rely on pane environment
+propagation.
 
 OMP may report a provider-local model alias such as `k3` after accepting an explicit
 `kimi-code/k3:high` launch. The adapter retains the immutable selected model for
